@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from einops import rearrange
 from scipy.spatial.transform import Rotation
@@ -15,6 +16,18 @@ def uniform(*size):
 
     R = Rotation.random(n_sample).as_matrix().reshape(*size)
     return torch.tensor(R).float()
+
+def isotropic_gaussian(sigma, size):
+    assert len(size) >= 2, "size must be at least 2-dimensional"
+    assert size[-2] == size[-1] == 3, "last two dimensions must be 3"
+
+    # sample rotational axis from uniform distribution on S^2 (unit sphere)
+    # this can be effectively done by sampling 3D standard Gaussian and
+    # normalizing the sampled vector to unit length
+    u = F.normalize(torch.randn(*size[:-1]), dim=-1) # *, L, 3
+
+    # sample rotation angle from Gaussian distribution
+    pass
 
 
 def tensor_trace(T):
