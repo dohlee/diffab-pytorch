@@ -17,7 +17,7 @@ def uniform(*size):
     R = Rotation.random(n_sample).as_matrix().reshape(*size)
     return torch.tensor(R).float()
 
-def isotropic_gaussian(sigma, size):
+def isotropic_gaussian_on_so3(sigma, size):
     assert len(size) >= 2, "size must be at least 2-dimensional"
     assert size[-2] == size[-1] == 3, "last two dimensions must be 3"
 

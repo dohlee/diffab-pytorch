@@ -6,7 +6,10 @@ import pytorch_lightning as pl
 
 
 class SingleAminoAcidEmbeddingMLP(nn.Module):
-    def __init__(self):
+    def __init__(self, d_type):
+        self.embed_type = nn.Embedding(20, d_type)
+
+        d_feat = d_type + 20
         pass
 
     def forward(self, x):
