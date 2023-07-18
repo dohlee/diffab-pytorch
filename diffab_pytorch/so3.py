@@ -1,8 +1,116 @@
+import os
 import torch
 import torch.nn.functional as F
 
 from einops import rearrange
 from scipy.spatial.transform import Rotation
+
+
+class SO3:
+    def __init__(
+        self,
+        sigmas_to_consider,
+        cache_prefix=".cache/so3_histograms",
+        sigma_threshold=0.1,
+        n_bins=8192,
+        num_iters=1024,
+    ):
+        self.cache_path = f"cache_prefix_bin{n_bins}_iter{num_iters}.pt"
+        self.bins = n_bins
+        self.num_iters = num_iters
+
+        # candidate list of sigmas to consider.
+        # this may be a whole list of variance along the variance schedule.
+        self.sigmas_to_consider = sigmas_to_consider
+
+        # threshold for sigma to determine whether to use histogram-based
+        # sampling or not.
+        # if sigma < sigma_threshold, use histogram-based sampling,
+        # otherwise sample from Gaussian(2*sigma, sigma) truncated to [0, pi)
+        self.sigma_threshold = sigma_threshold
+
+        self._initialize()
+        self.histograms = torch.load(self.cache_path)  # num_sigmas, bins
+
+    def _initialize(self):
+        if os.path.exists(self.cache_path):
+            return
+
+        cache_dir = os.path.dirname(self.cache_path)
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+
+        histograms = []
+        for sigma in self.sigmas_to_consider:
+            histograms.append(self._precompute_histogram(sigma))
+        histograms = torch.tensor(histograms)  # num_sigmas, bins
+
+        torch.save(histograms, self.cache_path)
+
+    def _precompute_histogram(self, sigma):
+        # evenly partition [0, pi] into 8192 bins,
+        # and use probability density p(theta|sigma^2)
+        # at the center of each bin as the bin weight
+        binsize = torch.pi / self.n_bins
+        bin_centers = torch.arange(0, torch.pi, binsize) + binsize / 2.0
+
+        # compute probability density p(theta|sigma^2) at each bin center
+        probs = self._angular_pdf(bin_centers, sigma, self.num_iters)
+        probs = torch.nan_to_num(probs).clamp_min(0.0)
+
+    def _angular_pdf(self, theta, sigma, num_iters):
+        l = torch.arange(self.num_iters).view(-1, 1)  # noqa: E741
+
+        a = (1 - torch.cos(theta)) / torch.pi
+        b = (2 * l + 1) * torch.exp(-l * (l + 1) * sigma**2)
+        c = torch.sin((l + 0.5) * theta) / torch.sin(theta / 2.0)
+
+        return (a * b * c).sum(axis=0)
+
+    def sample_from_histogram(self, sigma_idx):
+        probs = self.histograms[sigma_idx]  # len(sigma_idx), n_bins
+
+        # first sample bin according to the probability
+        bin_idx = torch.multinomial(probs, num_samples=1).flatten()
+        binsize = torch.pi / self.n_bins
+        bin_starts = torch.linspace(0, torch.pi, binsize)
+
+        # uniform sampling within the bin
+        sampled = bin_starts[bin_idx] + binsize * torch.rand_like(bin_idx)
+        return sampled
+
+    def sample_from_gaussian(self, sigma_idx):
+        mu = self.sigmas_to_consider[sigma_idx] * 2.0
+        std = self.sigmas_to_consider[sigma_idx]
+
+        sampled = mu + std * torch.randn_like(mu)
+        sampled = sampled % torch.pi  # truncate to [0, pi)
+
+        return sampled
+
+    @staticmethod
+    def sample_isotropic_gaussian(self, sigma_idx):
+        n = len(sigma_idx)
+        #
+        # Sample rotational axis from uniform distribution on S^2 (unit sphere).
+        #
+        # This can be effectively done by sampling 3D standard Gaussian and
+        # normalizing the sampled vector to unit length
+        u = F.normalize(torch.randn(n, 3), dim=-1)  # n, 3
+
+        #
+        # Sample rotation angle
+        #
+        # from histogram
+        theta_hist = self.sample_from_histogram(sigma_idx)
+
+        # from Gaussian distribution
+        theta_gaussian = self.sample_from_gaussian(sigma_idx)
+
+        use_hist = self.sigmas_to_consider[sigma_idx] < self.sigma_threshold
+        theta = torch.where(use_hist, theta_hist, theta_gaussian)
+
+        return u * theta[:, None]
 
 
 def uniform(*size):
@@ -17,15 +125,8 @@ def uniform(*size):
     R = Rotation.random(n_sample).as_matrix().reshape(*size)
     return torch.tensor(R).float()
 
+
 def isotropic_gaussian_on_so3(sigma, size):
-    assert len(size) >= 2, "size must be at least 2-dimensional"
-    assert size[-2] == size[-1] == 3, "last two dimensions must be 3"
-
-    # sample rotational axis from uniform distribution on S^2 (unit sphere)
-    # this can be effectively done by sampling 3D standard Gaussian and
-    # normalizing the sampled vector to unit length
-    u = F.normalize(torch.randn(*size[:-1]), dim=-1) # *, L, 3
-
     # sample rotation angle from Gaussian distribution
     pass
 
