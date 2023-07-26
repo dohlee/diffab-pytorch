@@ -61,10 +61,12 @@ def test_SequenceDiffuser_diffuse():
     bsz, L = 32, 100
     seq = torch.randint(0, 20, (bsz, L))
 
-    seq_t2 = seq_diffuser.diffuse_from_t0(seq, t=2)
-    seq_t99 = seq_diffuser.diffuse_from_t0(seq, t=99)
+    seq_t2, post_t2 = seq_diffuser.diffuse_from_t0(seq, t=2, return_posterior=True)
+    seq_t99, post_t99 = seq_diffuser.diffuse_from_t0(seq, t=99, return_posterior=True)
 
     assert seq_t2.shape == seq_t99.shape == (bsz, L)
+    assert post_t2.shape == (bsz, L, 20)
+    assert post_t99.shape == (bsz, L, 20)
 
     # sequence at t99 should deviate more from original sequence
     assert (seq_t2 != seq).sum() < (seq_t99 != seq).sum()

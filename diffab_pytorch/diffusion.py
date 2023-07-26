@@ -80,20 +80,32 @@ class SequenceDiffuser(object):
 
         return weighted_multinomial(seq, unif_noise, w_seq, w_unif_noise)
 
-    def diffuse_from_t0(self, seq_t0: torch.Tensor, t: int) -> torch.Tensor:
+    def diffuse_from_t0(
+        self, seq_t0: torch.Tensor, t: int, return_posterior: bool = True
+    ) -> torch.Tensor:
         """Sample a sequence at timestep t, given the sequence at timestep 0.
 
         Args:
             seq_t0 (torch.Tensor): Sequence at timestep 0. Shape: bsz, L
             t (int): Timestep
+            return_posterior (bool, optional): Whether to return the
+                posterior probability. Defaults to True.
 
         Returns:
             torch.Tensor: Sequence at timestep t. Shape: bsz, L
         """
         p = self.forward_prob_from_t0(seq_t0, t)
-        return torch.multinomial(p.view(-1, 20), num_samples=1).view(p.shape[:-1])
+        seq_t = torch.multinomial(p.view(-1, 20), num_samples=1).view(p.shape[:-1])
 
-    def posterior_single_step(self, seq_t, seq_t0, t):
+        if return_posterior:
+            posterior = self.posterior_single_step(seq_t, seq_t0, t)
+            return seq_t, posterior
+        else:
+            return seq_t
+
+    def posterior_single_step(
+        self, seq_t: torch.Tensor, seq_t0: torch.Tensor, t: int
+    ) -> torch.Tensor:
         """
         Compute the posterior probability of each amino acid at timestep t-1,
         given the sequence at timestep t.
