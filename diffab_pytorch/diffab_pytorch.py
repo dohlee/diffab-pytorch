@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 
+from einops import rearrange
+
 from torch import einsum
 from diffab_pytorch.diffusion import (
     SequenceDiffuser,
@@ -11,14 +13,79 @@ from diffab_pytorch.diffusion import (
 )
 
 
-class SingleAminoAcidEmbeddingMLP(nn.Module):
-    def __init__(self, d_type):
-        self.embed_type = nn.Embedding(20, d_type)
+class AngularEncoding(nn.Module):
+    def __init__(self, num_funcs=3):
+        super().__init__()
+        self.num_funcs = num_funcs
+        self.freq_bands = torch.tensor(
+            [i + 1.0 for i in range(num_funcs)] + [1.0 / (i + 1.0) for i in range(num_funcs)]
+        ).float()
 
-        d_feat = d_type + 20
-        pass
+    def get_output_dimension(self, d_in):
+        return d_in * (self.num_funcs * 2 * 2 + 1)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute angular encoding of a vector x.
+
+        Args:
+            x (torch.Tensor): Shape: ..., d_in
+
+        Returns:
+            torch.Tensor: ..., d_in * (num_funcs * 2 * 2 + 1)
+        """
+        x = x.unsqueeze(-1)  # ..., d_in, 1
+
+        encoded = torch.cat(
+            [
+                x,  # ..., d_in, 1
+                torch.sin(self.freq_bands * x),  # ..., d_in, num_funcs * 2
+                torch.cos(self.freq_bands * x),  # ..., d_in, num_funcs * 2
+            ],
+            dim=-1,
+        )  # ..., d_in, num_funcs * 2 * 2 + 1
+
+        encoded = rearrange(encoded, "... d1 d2 -> ... (d1 d2)")
+
+        return encoded
+
+
+class ResidueEmbedding(nn.Module):
+    def __init__(self, max_n_atoms_per_residue, d_feat):
+        super().__init__()
+        self.max_n_atoms_per_residue = max_n_atoms_per_residue
+
+        self.amino_acid_type_embedding = nn.Embedding(20, d_feat)
+        self.dihedral_embedding = AngularEncoding(num_funcs=3)
+        self.chain_embedding = nn.Embedding(10, d_feat, padding_idx=0)
+
+        d_coord = 20 * max_n_atoms_per_residue * 3
+        d_dihedral = self.dihedral_embedding.get_output_dimension(3)
+        d_flag = 1
+
+        self.mlp = nn.Sequential(
+            nn.Linear(d_feat + d_dihedral + d_coord + d_flag, d_feat * 2),
+            nn.ReLU(),
+            nn.Linear(d_feat * 2, d_feat),
+            nn.ReLU(),
+            nn.Linear(d_feat, d_feat),
+            nn.ReLU(),
+            nn.Linear(d_feat, d_feat),
+        )
+
+    def forward(
+        self, seq: torch.Tensor, xyz: torch.Tensor, orientation: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute residue-wise embedding using sequence, coordinate and orientation.
+
+        Args:
+            seq (torch.Tensor): Shape: bsz, L
+            xyz (torch.Tensor): Shape: bsz, L, A, 3
+            orientation (torch.Tensor): Shape: bsz, L, 3, 3
+
+        Returns:
+            torch.Tensor: Shape: bsz, L, d_feat
+        """
+
         pass
 
 
