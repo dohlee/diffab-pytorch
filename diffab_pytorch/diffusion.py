@@ -78,8 +78,16 @@ class SequenceDiffuser(object):
 
         return weighted_multinomial(seq, unif_noise, w_seq, w_unif_noise)
 
-    def diffuse_from_t0(self, seq_t0, t):
-        """"""
+    def diffuse_from_t0(self, seq_t0: torch.Tensor, t: int) -> torch.Tensor:
+        """Sample a sequence at timestep t, given the sequence at timestep 0.
+
+        Args:
+            seq_t0 (torch.Tensor): Sequence at timestep 0. Shape: bsz, L
+            t (int): Timestep
+
+        Returns:
+            torch.Tensor: Sequence at timestep t. Shape: bsz, L
+        """
         p = self.forward_prob_from_t0(seq_t0, t)
         return torch.multinomial(p.view(-1, 20), num_samples=1).view(p.shape[:-1])
 
@@ -102,8 +110,20 @@ class CoordinateDiffuser(object):
     def __init__(self, T, s=0.01, beta_max=0.999):
         self.sched = cosine_variance_schedule(T, s=s, beta_max=beta_max)
 
-    def diffuse_from_t0(self, xyz_t0, t, return_eps=True):
-        """"""
+    def diffuse_from_t0(
+        self, xyz_t0: torch.Tensor, t: int, return_eps: bool = True
+    ) -> torch.Tensor:
+        """Sample a coordinate at timestep t, given the coordinate at timestep 0.
+
+        Args:
+            xyz_t0 (torch.Tensor): Coordinate at timestep 0. Shape: bsz, L, 3
+            t (int): Timestep
+            return_eps (bool, optional):
+                Whether to return noise added to the coordinate. Defaults to True.
+
+        Returns:
+            torch.Tensor: Sampled coordinate at timestep t. Shape: bsz, L, 3
+        """
         alpha_bar_sqrt = self.sched["alpha_bar_sqrt"][t]
         one_minus_alpha_bar_sqrt = self.sched["one_minus_alpha_bar_sqrt"][t]
 
