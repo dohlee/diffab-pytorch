@@ -15,8 +15,8 @@ class SO3:
         n_bins=8192,
         num_iters=1024,
     ):
-        self.cache_path = f"cache_prefix_bin{n_bins}_iter{num_iters}.pt"
-        self.bins = n_bins
+        self.cache_path = f"{cache_prefix}/bin{n_bins}_iter{num_iters}.pt"
+        self.n_bins = n_bins
         self.num_iters = num_iters
 
         # candidate list of sigmas to consider.
@@ -43,7 +43,7 @@ class SO3:
         histograms = []
         for sigma in self.sigmas_to_consider:
             histograms.append(self._precompute_histogram(sigma))
-        histograms = torch.tensor(histograms)  # num_sigmas, bins
+        histograms = torch.stack(histograms)  # num_sigmas, bins
 
         torch.save(histograms, self.cache_path)
 
@@ -57,6 +57,8 @@ class SO3:
         # compute probability density p(theta|sigma^2) at each bin center
         probs = self._angular_pdf(bin_centers, sigma, self.num_iters)
         probs = torch.nan_to_num(probs).clamp_min(0.0)
+
+        return probs
 
     def _angular_pdf(self, theta, sigma, num_iters):
         l = torch.arange(self.num_iters).view(-1, 1)  # noqa: E741
@@ -88,7 +90,6 @@ class SO3:
 
         return sampled
 
-    @staticmethod
     def sample_isotropic_gaussian(self, sigma_idx):
         n = len(sigma_idx)
         #
@@ -126,11 +127,6 @@ def uniform(*size):
     return torch.tensor(R).float()
 
 
-def isotropic_gaussian_on_so3(sigma, size):
-    # sample rotation angle from Gaussian distribution
-    pass
-
-
 def tensor_trace(T):
     return T.diagonal(offset=0, dim1=-2, dim2=-1).sum(dim=-1)
 
@@ -160,6 +156,40 @@ def skew_symmetric_mat_to_vector(S):
     v_z = S[..., 1, 0]
 
     return torch.stack([v_x, v_y, v_z], dim=-1)
+
+
+def vector_to_skew_symmetric_mat(v: torch.Tensor) -> torch.Tensor:
+    """Convert a vector v to a skew-symmetric matrix S.
+
+    Args:
+        v (torch.Tensor): Shape: bsz, L, 3
+
+    Returns:
+        torch.Tensor: Shape: bsz, L, 3, 3
+    """
+    v_x, v_y, v_z = v[..., 0], v[..., 1], v[..., 2]
+
+    S = torch.zeros(*v.shape[:-1], 3, 3).to(v.device)
+    S[..., 0, 1] = -v_z
+    S[..., 0, 2] = v_y
+    S[..., 1, 0] = v_z
+    S[..., 1, 2] = -v_x
+    S[..., 2, 0] = -v_y
+    S[..., 2, 1] = v_x
+
+    return S
+
+
+def vector_to_rotation_matrix(v: torch.Tensor) -> torch.Tensor:
+    """Convert a vector v to a rotation matrix R.
+
+    Args:
+        v (torch.Tensor): Shape: bsz, L, 3
+
+    Returns:
+        torch.Tensor: Shape: bsz, L, 3, 3
+    """
+    return exp_skew_symmetric_mat(vector_to_skew_symmetric_mat(v))
 
 
 def exp_skew_symmetric_mat(S):

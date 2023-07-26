@@ -4,6 +4,8 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 
+import diffab_pytorch.so3 as so3
+
 
 def cosine_variance_schedule(T, s=8e-3, beta_max=0.999):
     # cosine variance schedule
@@ -137,5 +139,44 @@ class CoordinateDiffuser(object):
 
 
 class OrientationDiffuser(object):
-    def __init__(self, T, s=0.01, beta_max=0.999):
+    def __init__(self, T: int, s: float = 0.01, beta_max: float = 0.999):
+        """Diffuser for SO(3) rotations.
+
+        Args:
+            T (int): Maximum number of timesteps.
+            s (float, optional):
+                Small offset added to cosine variance schedule to prevent
+                beta being too small. Defaults to 0.01.
+            beta_max (float, optional):
+                To prevent singularities at the end of the diffusion process.
+                Defaults to 0.999.
+        """
         self.sched = cosine_variance_schedule(T, s=s, beta_max=beta_max)
+
+        self.so3 = so3.SO3(
+            sigmas_to_consider=self.sched["one_minus_alpha_bar_sqrt"],
+            cache_prefix=".cache/so3_histograms",
+            sigma_threshold=0.1,
+            n_bins=8192,
+            num_iters=1024,
+        )
+
+    def diffuse_from_t0(self, o: torch.Tensor, t: int) -> torch.Tensor:
+        """Sample an orientation at timestep t, given the orientation at timestep 0.
+
+        Args:
+            o (torch.Tensor):
+                Orientation (i.e., rotation matrix) at timestep 0. Shape: bsz, L, 3, 3
+            t (int): Timestep
+
+        Returns:
+            torch.Tensor: Sampled orientation at timestep t. Shape: bsz, L, 3, 3
+        """
+        mean_orientation = so3.scale_rot(o, self.sched["alpha_bar_sqrt"][t])
+
+        # sample from isotropic Gaussian IGSO3(R, sqrt(1-a))
+        noise = so3.vector_to_rotation_matrix(
+            self.so3.sample_isotropic_gaussian(t)
+        )  # bsz, 3, 3
+
+        return mean_orientation @ noise
