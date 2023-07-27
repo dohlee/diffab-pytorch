@@ -1,4 +1,5 @@
 import os
+import hashlib
 import torch
 import torch.nn.functional as F
 
@@ -15,7 +16,9 @@ class SO3:
         n_bins=8192,
         num_iters=1024,
     ):
-        self.cache_path = f"{cache_prefix}/bin{n_bins}_iter{num_iters}.pt"
+        h = hash((n_bins, num_iters, str(sigmas_to_consider)))
+        self.cache_path = f"{cache_prefix}/{h}/cache.pt"
+
         self.n_bins = n_bins
         self.num_iters = num_iters
 
@@ -75,10 +78,10 @@ class SO3:
         # first sample bin according to the probability
         bin_idx = torch.multinomial(probs, num_samples=1).flatten()
         binsize = torch.pi / self.n_bins
-        bin_starts = torch.linspace(0, torch.pi, binsize)
+        bin_starts = torch.arange(0, torch.pi, binsize)
 
         # uniform sampling within the bin
-        sampled = bin_starts[bin_idx] + binsize * torch.rand_like(bin_idx)
+        sampled = bin_starts[bin_idx] + binsize * torch.rand(bin_idx.shape)
         return sampled
 
     def sample_from_gaussian(self, sigma_idx):
