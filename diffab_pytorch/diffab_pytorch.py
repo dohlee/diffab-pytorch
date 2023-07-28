@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 
-from einops import rearrange
+from einops import rearrange, repeat
 
 from torch import einsum
 from diffab_pytorch.diffusion import (
@@ -52,18 +52,19 @@ class AngularEncoding(nn.Module):
 class ResidueEmbedding(nn.Module):
     def __init__(self, max_n_atoms_per_residue, d_feat):
         super().__init__()
+        self.max_n_amino_acid_types = 20  # TODO: why 22?
         self.max_n_atoms_per_residue = max_n_atoms_per_residue
 
-        self.amino_acid_type_embedding = nn.Embedding(20, d_feat)
+        self.amino_acid_type_embedding = nn.Embedding(self.max_n_amino_acid_types, d_feat)
         self.dihedral_embedding = AngularEncoding(num_funcs=3)
         self.chain_embedding = nn.Embedding(10, d_feat, padding_idx=0)
 
-        d_coord = 20 * max_n_atoms_per_residue * 3
+        d_coord = self.max_n_amino_acid_types * max_n_atoms_per_residue * 3
         d_dihedral = self.dihedral_embedding.get_output_dimension(3)
         d_flag = 1
 
         self.mlp = nn.Sequential(
-            nn.Linear(d_feat + d_dihedral + d_coord + d_flag, d_feat * 2),
+            nn.Linear(d_feat + d_coord + d_dihedral + d_flag, d_feat * 2),
             nn.ReLU(),
             nn.Linear(d_feat * 2, d_feat),
             nn.ReLU(),
@@ -73,20 +74,83 @@ class ResidueEmbedding(nn.Module):
         )
 
     def forward(
-        self, seq: torch.Tensor, xyz: torch.Tensor, orientation: torch.Tensor
+        self,
+        seq: torch.Tensor,
+        xyz: torch.Tensor,
+        dihedrals: torch.Tensor,
+        chain_idx: torch.Tensor,
+        orientation: torch.Tensor,
+        atom_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Compute residue-wise embedding using sequence, coordinate and orientation.
 
         Args:
             seq (torch.Tensor): Shape: bsz, L
             xyz (torch.Tensor): Shape: bsz, L, A, 3
+            dihedrals (torch.Tensor): Shape: bsz, L, 3
+            chain_idx (torch.Tensor): Shape: bsz, L
             orientation (torch.Tensor): Shape: bsz, L, 3, 3
+            atom_mask (torch.Tensor): Mask denoting whether it is a valid Shape: bsz, L, A
 
         Returns:
             torch.Tensor: Shape: bsz, L, d_feat
         """
+        bsz, L = seq.shape
+        N_IDX, CA_IDX, C_IDX, CB_IDX = 0, 1, 2, 3
+        residue_mask = atom_mask[:, :, CA_IDX]
 
-        pass
+        # amino acid type embedding
+        aa_type_feat = self.amino_acid_type_embedding(seq)  # bsz, L, d_feat
+
+        # coordinate embedding
+        # first compute local coordinate O^{T} * (X - X_{CA})
+        xyz_rel = xyz - xyz[:, :, CA_IDX, :].unsqueeze(-2)  # bsz, L, A, 3
+        xyz_local = orientation.transpose(-1, -2) @ xyz_rel
+
+        seq_expanded = repeat(
+            seq,
+            "b l -> b l t a d",
+            f=self.max_n_amino_acid_types,
+            a=self.max_n_atoms_per_residue,
+            d=3,
+        )
+        xyz_expanded = repeat(
+            xyz_local,
+            "b l a d -> b l t a d",
+            f=self.max_n_amino_acid_types,
+        )
+        idx_expanded = repeat(
+            torch.arange(self.max_n_amino_acid_types).to(xyz.device),
+            "t -> b l t a d",
+            b=bsz,
+            l=L,
+            a=self.max_n_atoms_per_residue,
+            d=3,
+        )
+        coord_feat = torch.where(
+            seq_expanded == idx_expanded,
+            xyz_expanded,
+            torch.zeros_like(xyz_expanded),
+        )
+
+        coord_feat = rearrange(coord_feat, "b l t a d -> b l (t a d)")  # bsz, L, D
+        # where D = self.max_n_amino_acid_types * max_n_atoms_per_residue * 3
+
+        # dihedral embedding by applying angular encoding
+        dihedral_feat = self.dihedral_embedding(dihedrals)
+
+        # chain embedding
+        chain_feat = self.chain_embedding(chain_idx)  # bsz, L, d_feat
+
+        x = torch.cat(
+            [
+                aa_type_feat,
+                coord_feat,
+                dihedral_feat,
+                chain_feat,
+            ]
+        )
+        return self.mlp(x)
 
 
 class PairwiseEmbeddingMLP(nn.Module):
