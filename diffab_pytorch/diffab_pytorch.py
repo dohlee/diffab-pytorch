@@ -261,12 +261,148 @@ class PairEmbedding(nn.Module):
         return self.mlp(x) * residue_mask_pair[:, :, :, None]
 
 
-class InvariantPointAttention(nn.Module):
-    def __init__(self):
-        pass
+def euclidean_transform(x, r, t):
+    """r: rotation matrix of size (b, l, 3, 3)
+    t: translation vector of size (b, l, 3)
+    """
+    # infer number of heads
+    n = x.size(1)
+    r = repeat(r, "b l x y -> b n l x y", n=n)
+    t = repeat(t, "b l x -> b n l () x", n=n)
 
-    def forward(self, x):
-        pass
+    return einsum("b n l d k, b n l k c -> b n l d c", x, r) + t
+
+
+def inverse_euclidean_transform(x, r, t):
+    """r: rotation matrix of size (b, l, 3, 3)
+    t: translation vector of size (b, l, 3)
+    """
+    # infer number of heads
+    n = x.size(1)
+    r_inv = repeat(r, "b l x y  -> b n l y x", n=n)  # note that R^-1 = R^T
+    t = repeat(t, "b l x -> b n l () x", n=n)
+
+    return einsum("b n l d k, b n l k c -> b n l d c", x - t, r_inv)
+
+
+class InvariantPointAttention(nn.Module):
+    def __init__(
+        self,
+        d_orig,
+        d_scalar_per_head=16,
+        n_query_point_per_head=4,
+        n_value_point_per_head=4,
+        n_head=8,
+        use_pair_bias=True,
+    ):
+        super().__init__()
+        self.n_head = n_head
+        self.use_pair_bias = use_pair_bias
+
+        # standard self-attention (scalar attention)
+        d_scalar = d_scalar_per_head * n_head
+        self.to_q_scalar = nn.Linear(d_orig, d_scalar, bias=False)
+        self.to_k_scalar = nn.Linear(d_orig, d_scalar, bias=False)
+        self.to_v_scalar = nn.Linear(d_orig, d_scalar, bias=False)
+        self.scale_scalar = d_scalar_per_head**-0.5
+
+        # modulation by pair representation
+        if self.use_pair_bias:
+            self.to_pair_bias = nn.Linear(d_orig, n_head, bias=False)
+
+        # point attention
+        d_query_point = (n_query_point_per_head * 3) * n_head
+        d_value_point = (n_value_point_per_head * 3) * n_head
+        n_value_point = n_value_point_per_head * n_head
+        self.to_q_point = nn.Linear(d_orig, d_query_point, bias=False)
+        self.to_k_point = nn.Linear(d_orig, d_query_point, bias=False)
+        self.to_v_point = nn.Linear(d_orig, d_value_point, bias=False)
+        self.scale_point = (4.5 * n_query_point_per_head) ** -0.5
+        self.gamma = nn.Parameter(torch.log(torch.exp(torch.ones(n_head)) - 1.0))
+
+        if use_pair_bias:
+            d_pair = d_orig * n_head
+            self.to_out = nn.Linear(d_scalar + d_pair + d_value_point + n_value_point, d_orig)
+        else:
+            self.to_out = nn.Linear(d_scalar + d_value_point + n_value_point, d_orig)
+
+        self.num_independent_logits = 3 if use_pair_bias else 2
+
+        self.scale_total = self.num_independent_logits**-0.5
+
+    def forward(self, x, e, r, t):
+        # query, key and values for scalar
+        q_scalar = self.to_q_scalar(x)
+        k_scalar = self.to_k_scalar(x)
+        v_scalar = self.to_v_scalar(x)
+
+        q_scalar, k_scalar, v_scalar = map(
+            lambda t: rearrange(t, "b l (n d) -> b n l d", n=self.n_head),
+            (q_scalar, k_scalar, v_scalar),
+        )
+
+        # query, key and values for points
+        q_point = self.to_q_point(x)
+        k_point = self.to_k_point(x)
+        v_point = self.to_v_point(x)
+
+        q_point, k_point, v_point = map(
+            lambda t: rearrange(t, "b l (n p c) -> b n l p c", n=self.n_head, c=3),
+            (q_point, k_point, v_point),
+        )
+
+        q_point, k_point, v_point = map(
+            lambda v: euclidean_transform(v, r, t),
+            (q_point, k_point, v_point),
+        )
+
+        # standard self-attention (scalar attention)
+        logit_scalar = (
+            einsum("b n i d, b n j d -> b n i j", q_scalar, k_scalar) * self.scale_scalar
+        )
+
+        # modulation by pair representation
+        if self.use_pair_bias:
+            bias_pair = rearrange(self.to_pair_bias(e), "b i j n -> b n i j")
+
+        # point attention
+        all_pairwise_diff = rearrange(q_point, "b n i p c -> b n i () p c") - rearrange(
+            k_point, "b n j p c -> b n () j p c"
+        )
+        gamma = rearrange(self.gamma, "n -> () n () ()")
+
+        logit_point = (
+            -0.5 * self.scale_point * gamma * (all_pairwise_diff**2).sum(dim=-1).sum(dim=-1)
+        )
+
+        if self.use_pair_bias:
+            logit = self.scale_total * (logit_scalar + bias_pair + logit_point)
+        else:
+            logit = self.scale_total * (logit_scalar + logit_point)
+
+        attn = logit.softmax(dim=-1)
+
+        out_scalar = einsum("b n i j, b n j d -> b n i d", attn, v_scalar)
+        out_scalar = rearrange(out_scalar, "b n i d -> b i (n d)")
+
+        if self.use_pair_bias:
+            out_pair = einsum("b n i j, b i j d -> b n i d", attn, e)
+            out_pair = rearrange(out_pair, "b n i d -> b i (n d)")
+
+        out_point = einsum("b n i j, b n j p c -> b n i p c", attn, v_point)
+        out_point = inverse_euclidean_transform(out_point, r, t)
+        out_point_norm = out_point.norm(dim=-1, keepdim=True)
+
+        out_point = rearrange(out_point, "b n i p c -> b i (n p c)")
+        out_point_norm = rearrange(out_point_norm, "b n i p c -> b i (n p c)")
+
+        if self.use_pair_bias:
+            out = torch.cat([out_scalar, out_pair, out_point, out_point_norm], dim=-1)
+        else:
+            out = torch.cat([out_scalar, out_point, out_point_norm], dim=-1)
+
+        x = self.to_out(out)
+        return x
 
 
 class AminoAcidDenoising(nn.Module):

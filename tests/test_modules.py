@@ -1,6 +1,11 @@
 import torch
 
-from diffab_pytorch.diffab_pytorch import AngularEncoding, ResidueEmbedding, PairEmbedding
+from diffab_pytorch.diffab_pytorch import (
+    AngularEncoding,
+    ResidueEmbedding,
+    PairEmbedding,
+    InvariantPointAttention,
+)
 
 from scipy.spatial.transform import Rotation as R
 from protstruc import StructureBatch
@@ -105,3 +110,29 @@ def test_PairEmbedding():
     )
 
     assert out.shape == (bsz, n_res, n_res, d_feat)
+
+
+def test_InvariantPointAttention():
+    d_orig = 32
+    d_scalar_per_head = 16
+    n_query_point_per_head = 4
+    n_value_point_per_head = 4
+    n_head = 8
+
+    ipa = InvariantPointAttention(
+        d_orig,
+        d_scalar_per_head,
+        n_query_point_per_head,
+        n_value_point_per_head,
+        n_head,
+    )
+
+    bsz, n_res = 32, 16
+    x = torch.rand(bsz, n_res, d_orig)
+    e = torch.rand(bsz, n_res, n_res, d_orig)
+
+    r = torch.rand(bsz, n_res, 3, 3)
+    t = torch.rand(bsz, n_res, 3)
+
+    out = ipa(x, e, r, t)
+    assert out.shape == (bsz, n_res, d_orig)
