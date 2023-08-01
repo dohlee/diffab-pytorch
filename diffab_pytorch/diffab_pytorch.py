@@ -61,10 +61,10 @@ class ResidueEmbedding(nn.Module):
 
         d_coord = self.max_n_amino_acid_types * max_n_atoms_per_residue * 3
         d_dihedral = self.dihedral_embedding.get_output_dimension(3)
-        d_flag = 1
+        # d_flag = 1
 
         self.mlp = nn.Sequential(
-            nn.Linear(d_feat + d_coord + d_dihedral + d_flag, d_feat * 2),
+            nn.Linear(d_feat + d_coord + d_dihedral + d_feat, d_feat * 2),
             nn.ReLU(),
             nn.Linear(d_feat * 2, d_feat),
             nn.ReLU(),
@@ -96,28 +96,30 @@ class ResidueEmbedding(nn.Module):
             torch.Tensor: Shape: bsz, L, d_feat
         """
         bsz, L = seq.shape
-        N_IDX, CA_IDX, C_IDX, CB_IDX = 0, 1, 2, 3
-        residue_mask = atom_mask[:, :, CA_IDX]
+        CA_IDX = 1
 
         # amino acid type embedding
         aa_type_feat = self.amino_acid_type_embedding(seq)  # bsz, L, d_feat
 
         # coordinate embedding
         # first compute local coordinate O^{T} * (X - X_{CA})
-        xyz_rel = xyz - xyz[:, :, CA_IDX, :].unsqueeze(-2)  # bsz, L, A, 3
-        xyz_local = orientation.transpose(-1, -2) @ xyz_rel
+        xyz_rel = xyz - xyz[:, :, CA_IDX, :].unsqueeze(-2)  # bsz, L, A, 3 (global coords)
+        orientation_t = rearrange(orientation, "b l r1 r2 -> b l r2 r1")
+        xyz_local = einsum(
+            "b l i j, b l a j -> b l a i", orientation_t, xyz_rel
+        )  # bsz, L, A, 3 (local coords)
 
         seq_expanded = repeat(
             seq,
             "b l -> b l t a d",
-            f=self.max_n_amino_acid_types,
+            t=self.max_n_amino_acid_types,
             a=self.max_n_atoms_per_residue,
             d=3,
         )
         xyz_expanded = repeat(
             xyz_local,
             "b l a d -> b l t a d",
-            f=self.max_n_amino_acid_types,
+            t=self.max_n_amino_acid_types,
         )
         idx_expanded = repeat(
             torch.arange(self.max_n_amino_acid_types).to(xyz.device),
@@ -148,17 +150,115 @@ class ResidueEmbedding(nn.Module):
                 coord_feat,
                 dihedral_feat,
                 chain_feat,
-            ]
+            ],
+            dim=-1,
         )
         return self.mlp(x)
 
 
-class PairwiseEmbeddingMLP(nn.Module):
-    def __init__(self):
-        pass
+class PairEmbedding(nn.Module):
+    def __init__(self, max_n_atoms_per_residue, d_feat, max_dist_to_consider=32):
+        super().__init__()
 
-    def forward(self, x):
-        pass
+        self.d_feat = d_feat
+        self.max_dist_to_consider = max_dist_to_consider
+
+        self.max_n_amino_acid_types = 20  # TODO: why 22?
+        self.amino_acid_type_pair_embedding = nn.Embedding(
+            self.max_n_amino_acid_types**2, d_feat
+        )
+
+        self.relpos_embedding = nn.Embedding(2 * max_dist_to_consider + 1, d_feat)
+
+        self.pair2distcoef = nn.Embedding(
+            self.max_n_amino_acid_types**2, max_n_atoms_per_residue**2
+        )
+        nn.init.zeros_(self.pair2distcoef.weight)
+        self.distance_embedding = nn.Sequential(
+            nn.Linear(max_n_atoms_per_residue**2, d_feat),
+            nn.ReLU(),
+            nn.Linear(d_feat, d_feat),
+            nn.ReLU(),
+        )
+
+        self.dihedral_embedding = AngularEncoding(2)  # phi and psi
+        d_dihedral = self.dihedral_embedding.get_output_dimension(2)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(d_feat + d_feat + d_feat + d_dihedral, d_feat),
+            nn.ReLU(),
+            nn.Linear(d_feat, d_feat),
+            nn.ReLU(),
+            nn.Linear(d_feat, d_feat),
+        )
+
+    def forward(
+        self,
+        seq: torch.Tensor,
+        residue_idx: torch.Tensor,
+        chain_idx: torch.Tensor,
+        distmat: torch.Tensor,
+        dihedrals: torch.Tensor,
+        atom_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """_summary_
+
+        Args:
+            seq: Amino acid sequence. Shape: bsz, L
+            residue_idx: Residue index. Shape: bsz, L
+            chain_idx: Chain index. Shape: bsz, L
+            distmat: Inter-residue atom distances. Shape: bsz, L, L, A, A
+            dihedrals: Inter-residue phi and psi angles. Shape: bsz, L, L, 2
+            atom_mask: Whether an atom is valid for each residue. Shape: bsz, L, A
+
+        Returns:
+            Shape: bsz, L, L, d_feat
+        """
+        bsz, L = seq.shape
+        CA_IDX = 1
+
+        atom_mask_pair = atom_mask[:, :, None, :, None] * atom_mask[:, None, :, None, :]
+        atom_mask_pair = rearrange(
+            atom_mask_pair, "b l1 l2 a1 a2 -> b l1 l2 (a1 a2)"
+        )  # bsz, L, L, A * A
+
+        residue_mask = atom_mask[:, :, CA_IDX]  # bsz, L
+        residue_mask_pair = residue_mask[:, :, None] * residue_mask[:, None, :]  # bsz, L, L
+
+        # amino acid type pair embedding
+        seq_pair = seq[:, :, None] * self.max_n_amino_acid_types + seq[:, None, :]
+        seq_pair_feat = self.amino_acid_type_pair_embedding(seq_pair)  # bsz, L, L, d_feat
+
+        # relative 1D position embedding
+        same_chain_mask = chain_idx[:, :, None] * chain_idx[:, None, :]
+
+        relpos = residue_idx[:, :, None] - residue_idx[:, None, :]
+        relpos = relpos.clamp(
+            -self.max_dist_to_consider, self.max_dist_to_consider
+        )  # bsz, L, L
+
+        relpos_feat = self.relpos_embedding(relpos + self.max_dist_to_consider)
+        relpos_feat = relpos_feat * same_chain_mask[:, :, :, None]
+
+        # distance embedding
+        coef = F.softplus(self.pair2distcoef(seq_pair))  # bsz, L, L, A * A
+        distmat = rearrange(distmat, "b l1 l2 a1 a2 -> b l1 l2 (a1 a2)")
+        distmat = torch.exp(-1 * coef * distmat**2)  # bsz, L, L, A * A
+        dist_feat = self.distance_embedding(distmat * atom_mask_pair)  # bsz, L, L, d_feat
+
+        # dihedral embedding
+        dihedral_feat = self.dihedral_embedding(dihedrals)  # bsz, L, L, d_dihedral
+
+        x = torch.cat(
+            [
+                seq_pair_feat,
+                relpos_feat,
+                dist_feat,
+                dihedral_feat,
+            ],
+            dim=-1,
+        )
+        return self.mlp(x) * residue_mask_pair[:, :, :, None]
 
 
 class InvariantPointAttention(nn.Module):
