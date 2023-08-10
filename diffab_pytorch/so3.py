@@ -160,6 +160,18 @@ def skew_symmetric_mat_to_vector(S):
     return torch.stack([v_x, v_y, v_z], dim=-1)
 
 
+def rotation_matrix_to_vector(R: torch.Tensor) -> torch.Tensor:
+    """Convert a rotation matrix to a so3 vector.
+
+    Args:
+        R: A rotation matrix. Shape: *, 3, 3
+
+    Returns:
+        v: An so3 vector. Shape: *, 3
+    """
+    return skew_symmetric_mat_to_vector(log_rotmat(R))
+
+
 def vector_to_skew_symmetric_mat(v: torch.Tensor) -> torch.Tensor:
     """Convert a vector v to a skew-symmetric matrix S.
 

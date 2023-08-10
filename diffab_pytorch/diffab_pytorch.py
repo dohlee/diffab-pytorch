@@ -1,15 +1,20 @@
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
-
 from einops import rearrange, repeat
-
 from torch import einsum
+
+from protstruc import StructureBatch
+
 from diffab_pytorch.diffusion import (
-    SequenceDiffuser,
     CoordinateDiffuser,
     OrientationDiffuser,
+    SequenceDiffuser,
+)
+from diffab_pytorch.so3 import (
+    vector_to_rotation_matrix,
+    rotation_matrix_to_vector,
 )
 
 
@@ -285,7 +290,7 @@ def inverse_euclidean_transform(x, r, t):
     return einsum("b n l d k, b n l k c -> b n l d c", x - t, r_inv)
 
 
-class InvariantPointAttention(nn.Module):
+class InvariantPointAttentionLayer(nn.Module):
     def __init__(
         self,
         d_orig,
@@ -405,28 +410,137 @@ class InvariantPointAttention(nn.Module):
         return x
 
 
-class AminoAcidDenoising(nn.Module):
-    def __init__(self):
-        pass
+class InvariantPointAttentionModule(nn.Module):
+    def __init__(
+        self,
+        n_layers,
+        d_orig,
+        d_scalar_per_head,
+        n_query_point_per_head,
+        n_value_point_per_head,
+        n_head,
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                InvariantPointAttentionLayer(
+                    d_orig,
+                    d_scalar_per_head,
+                    n_query_point_per_head,
+                    n_value_point_per_head,
+                    n_head,
+                )
+                for _ in range(n_layers)
+            ]
+        )
 
-    def forward(self, x):
-        pass
+    def forward(self, res_emb, pair_emb, orientations, translations):
+        for layer in self.layers:
+            res_emb = layer(res_emb, pair_emb, orientations, translations)
+
+        return res_emb
 
 
-class CaCoordinateDenoising(nn.Module):
-    def __init__(self):
-        pass
+class Denoiser(nn.Module):
+    def __init__(
+        self,
+        d_emb,
+        n_ipa_layers,
+        d_scalar_per_head,
+        n_query_point_per_head,
+        n_value_point_per_head,
+        n_head,
+    ):
+        super().__init__()
+        self.sequence_embedding = nn.Embedding(25, d_emb)
+        self.to_res_emb = nn.Sequential(
+            nn.Linear(d_emb * 2, d_emb),
+            nn.ReLU(),
+            nn.Linear(d_emb, d_emb),
+        )
 
-    def forward(self, x):
-        pass
+        self.ipa = InvariantPointAttentionModule(
+            n_ipa_layers,
+            d_emb,
+            d_scalar_per_head,
+            n_query_point_per_head,
+            n_value_point_per_head,
+            n_head,
+        )
 
+        d_beta_emb = 3  # dimension for beta encoding
 
-class OrientationDenoising(nn.Module):
-    def __init__(self):
-        pass
+        self.coordinate_denoising = nn.Sequential(
+            nn.Linear(d_emb + d_beta_emb, d_emb),
+            nn.ReLU(),
+            nn.Linear(d_emb, d_emb),
+            nn.ReLU(),
+            nn.Linear(d_emb, 3),
+        )
 
-    def forward(self, x):
-        pass
+        self.orientation_denoising = nn.Sequential(
+            nn.Linear(d_emb + d_beta_emb, d_emb),
+            nn.ReLU(),
+            nn.Linear(d_emb, d_emb),
+            nn.ReLU(),
+            nn.Linear(d_emb, 3),
+        )
+
+        self.sequence_denoising = nn.Sequential(
+            nn.Linear(d_emb + d_beta_emb, d_emb),
+            nn.ReLU(),
+            nn.Linear(d_emb, d_emb),
+            nn.ReLU(),
+            nn.Linear(d_emb, 20),
+            nn.Softmax(dim=-1),
+        )
+
+    def forward(
+        self,
+        s_t: torch.Tensor,
+        x_t: torch.Tensor,
+        o_t: torch.Tensor,
+        res_emb: torch.Tensor,
+        pair_emb: torch.Tensor,
+        beta: torch.Tensor,
+        generation_mask: torch.Tensor,
+        residue_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz, n_residues = s_t.shape[:2]
+
+        # embed current sequence information to res_emb
+        s_emb = self.sequence_embedding(s_t)  # b n d_emb
+        res_emb = torch.cat([res_emb, s_emb], dim=-1)  # b n (d_emb * 2)
+        res_emb = self.to_res_emb(res_emb)  # b n d_emb
+
+        # embed pair_emb to res_emb using Invariant Point Attention
+        res_emb = self.ipa(res_emb, pair_emb, o_t, x_t)
+
+        # variance (or timepoint, equivalently) embedding
+        t_emb = torch.stack([beta, torch.sin(beta), torch.cos(beta)], dim=-1)  # b 3
+        t_emb = repeat(t_emb, "b d -> b n d", n=n_residues)  # b n 3
+
+        # finalize residue embedding
+        res_emb = torch.cat([res_emb, t_emb], dim=-1)  # b n (d_emb + 3)
+
+        # denoise coordinates and predict epsilon
+        x_epsilon = self.coordinate_denoising(res_emb)  # b n 3
+
+        # denoise orientations
+        v_epsilon = self.orientation_denoising(res_emb)  # b n 3
+        o_epsilon = vector_to_rotation_matrix(v_epsilon)  # b n 3 3
+        o_denoised = o_t @ o_epsilon  # b n 3 3
+
+        # denoise sequence probabilities
+        s_denoised_prob = self.sequence_denoising(res_emb)  # b n 20
+
+        out = {
+            "xyz_eps": x_epsilon,
+            "rotmat_t0": o_denoised,
+            "seq_posterior": s_denoised_prob,
+        }
+
+        return out
 
 
 class OrientationLoss(nn.Module):
@@ -444,8 +558,39 @@ class OrientationLoss(nn.Module):
 
 
 class DiffAb(pl.LightningModule):
-    def __init__(self, T=100, s=0.01, beta_max=0.999):
+    def __init__(
+        self,
+        d_emb,
+        n_ipa_layers,
+        d_scalar_per_head,
+        n_query_point_per_head,
+        n_value_point_per_head,
+        n_head,
+        T=100,
+        s=0.01,
+        beta_max=0.999,
+        max_atoms_per_residue=25,
+        max_dist_to_consider=32,
+    ):
         super().__init__()
+
+        self.residue_embedding = ResidueEmbedding(
+            max_n_atoms_per_residue=max_atoms_per_residue, d_feat=d_emb
+        )
+        self.pair_embedding = PairEmbedding(
+            max_n_atoms_per_residue=max_atoms_per_residue,
+            d_feat=d_emb,
+            max_dist_to_consider=max_dist_to_consider,
+        )
+
+        self.denoiser = Denoiser(
+            d_emb,
+            n_ipa_layers,
+            d_scalar_per_head,
+            n_query_point_per_head,
+            n_value_point_per_head,
+            n_head,
+        )
 
         self.seq_diffuser = SequenceDiffuser(T=T, s=s, beta_max=beta_max)
         self.coordinate_diffuser = CoordinateDiffuser(T=T, s=s, beta_max=beta_max)
@@ -455,8 +600,31 @@ class DiffAb(pl.LightningModule):
         self.coordinate_loss = nn.MSELoss()
         self.orientation_loss = OrientationLoss()
 
-    def forward(self, x):
-        pass
+    def forward(self, batch):
+        xyz = batch["xyz"]
+        atom_mask = batch["atom_mask"]
+        seq = batch["seq"]
+        chain_idx, chain_ids = batch["chain_idx"], batch["chain_ids"]
+
+        sb = StructureBatch.from_xyz(xyz, atom_mask)
+        backbone_dihedrals = sb.backbone_dihedrals()  # b n 3 3
+        orientation = sb.backbone_orientations()
+
+        res_emb = self.residue_embedding(
+            seq, xyz, backbone_dihedrals, chain_idx, orientation, atom_mask
+        )
+
+        residue_idx = batch["residue_idx"]
+
+        distmat = sb.pairwise_distance_matrix()
+
+        phi = sb.pairwise_dihedrals(atoms_i=["C"], atoms_j=["N", "CA", "C"])
+        psi = sb.pairwise_dihedrals(atoms_i=["N", "CA", "C"], atoms_j=["N"])
+        pairwise_dihedrals = torch.stack([phi, psi], dim=-1)
+
+        pair_emb = self.pair_embedding(
+            seq, residue_idx, chain_idx, distmat, pairwise_dihedrals, atom_mask
+        )
 
     def training_step(self, batch, batch_idx):
         device = batch.device
@@ -480,9 +648,8 @@ class DiffAb(pl.LightningModule):
         rotmat_t = self.orientation_diffuser.diffuse_from_t0(rotmat_t0, t)
 
         # predict sequence posterior probs at timestep t-1 (`seq_posterior`),
-        # noise added to xyz (`xyz_eps`), and orientation at timestep t0 (`rotmat`)
+        # noise added to xyz (`xyz_eps`), and orientation at timestep t0 (`rotmat_t0`)
         out = self.forward(seq_t, xyz_t, rotmat_t)
-        # out['seq_posterior'], out['xyz_eps'], out['rotmat_t0']
 
         # compute loss
         seq_loss = self.aa_loss(out["seq_posterior"].log(), seq_posterior)
