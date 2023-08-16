@@ -6,8 +6,10 @@ from einops import rearrange, repeat
 from torch import einsum
 
 from protstruc import StructureBatch
+from protstruc.general import ATOM, AA
 
 from diffab_pytorch.diffusion import (
+    cosine_variance_schedule,
     CoordinateDiffuser,
     OrientationDiffuser,
     SequenceDiffuser,
@@ -23,7 +25,8 @@ class AngularEncoding(nn.Module):
         super().__init__()
         self.num_funcs = num_funcs
         self.freq_bands = torch.tensor(
-            [i + 1.0 for i in range(num_funcs)] + [1.0 / (i + 1.0) for i in range(num_funcs)]
+            [i + 1.0 for i in range(num_funcs)]
+            + [1.0 / (i + 1.0) for i in range(num_funcs)]
         ).float()
 
     def get_output_dimension(self, d_in):
@@ -57,14 +60,14 @@ class AngularEncoding(nn.Module):
 class ResidueEmbedding(nn.Module):
     def __init__(self, max_n_atoms_per_residue, d_feat):
         super().__init__()
-        self.max_n_amino_acid_types = 20  # TODO: why 22?
+        self.max_n_aa_types = 21  # TODO: why 22?
         self.max_n_atoms_per_residue = max_n_atoms_per_residue
 
-        self.amino_acid_type_embedding = nn.Embedding(self.max_n_amino_acid_types, d_feat)
+        self.amino_acid_type_embedding = nn.Embedding(self.max_n_aa_types, d_feat)
         self.dihedral_embedding = AngularEncoding(num_funcs=3)
         self.chain_embedding = nn.Embedding(10, d_feat, padding_idx=0)
 
-        d_coord = self.max_n_amino_acid_types * max_n_atoms_per_residue * 3
+        d_coord = self.max_n_aa_types * max_n_atoms_per_residue * 3
         d_dihedral = self.dihedral_embedding.get_output_dimension(3)
         # d_flag = 1
 
@@ -80,54 +83,66 @@ class ResidueEmbedding(nn.Module):
 
     def forward(
         self,
-        seq: torch.Tensor,
+        seq_idx: torch.Tensor,
         xyz: torch.Tensor,
+        orientation: torch.Tensor,
         dihedrals: torch.Tensor,
         chain_idx: torch.Tensor,
-        orientation: torch.Tensor,
         atom_mask: torch.Tensor,
+        structure_context_mask: torch.Tensor = None,
+        sequence_context_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """Compute residue-wise embedding using sequence, coordinate and orientation.
 
         Args:
-            seq (torch.Tensor): Shape: bsz, L
+            seq_idx (torch.Tensor): Shape: bsz, L
             xyz (torch.Tensor): Shape: bsz, L, A, 3
+            orientation (torch.Tensor): Shape: bsz, L, 3, 3
             dihedrals (torch.Tensor): Shape: bsz, L, 3
             chain_idx (torch.Tensor): Shape: bsz, L
-            orientation (torch.Tensor): Shape: bsz, L, 3, 3
             atom_mask (torch.Tensor): Mask denoting whether it is a valid Shape: bsz, L, A
+            structure_context_mask: Mask denoting whether a residue is in the structural context.
+                Shape: bsz, L
+            sequence_context_mask: Mask denoting whether a residue is in the sequence context.
+                Shape: bsz, L
 
         Returns:
             torch.Tensor: Shape: bsz, L, d_feat
         """
-        bsz, L = seq.shape
+        bsz, L = seq_idx.shape
         CA_IDX = 1
 
         # amino acid type embedding
-        aa_type_feat = self.amino_acid_type_embedding(seq)  # bsz, L, d_feat
+        if sequence_context_mask is not None:  # fill non-context residues with UNK
+            _mask = sequence_context_mask.bool()
+            seq_idx = torch.where(_mask, seq_idx, torch.full_like(seq_idx, AA.UNK))
+        aa_type_feat = self.amino_acid_type_embedding(seq_idx)  # bsz, L, d_feat
 
         # coordinate embedding
         # first compute local coordinate O^{T} * (X - X_{CA})
-        xyz_rel = xyz - xyz[:, :, CA_IDX, :].unsqueeze(-2)  # bsz, L, A, 3 (global coords)
-        orientation_t = rearrange(orientation, "b l r1 r2 -> b l r2 r1")
+        xyz_rel = xyz - xyz[:, :, CA_IDX, :].unsqueeze(
+            -2
+        )  # bsz, L, A, 3 (global coords)
+        orientation_transposed = rearrange(orientation, "b l r1 r2 -> b l r2 r1")
         xyz_local = einsum(
-            "b l i j, b l a j -> b l a i", orientation_t, xyz_rel
-        )  # bsz, L, A, 3 (local coords)
+            "b l i j, b l a j -> b l a i", orientation_transposed, xyz_rel
+        )
+        xyz_local *= atom_mask[:, :, :, None]  # bsz, L, A, 3 (local coords)
 
         seq_expanded = repeat(
-            seq,
+            seq_idx,
             "b l -> b l t a d",
-            t=self.max_n_amino_acid_types,
+            t=self.max_n_aa_types,
             a=self.max_n_atoms_per_residue,
             d=3,
         )
         xyz_expanded = repeat(
             xyz_local,
             "b l a d -> b l t a d",
-            t=self.max_n_amino_acid_types,
+            t=self.max_n_aa_types,
         )
         idx_expanded = repeat(
-            torch.arange(self.max_n_amino_acid_types).to(xyz.device),
+            torch.arange(self.max_n_aa_types).to(xyz.device),
             "t -> b l t a d",
             b=bsz,
             l=L,
@@ -142,9 +157,19 @@ class ResidueEmbedding(nn.Module):
 
         coord_feat = rearrange(coord_feat, "b l t a d -> b l (t a d)")  # bsz, L, D
         # where D = self.max_n_amino_acid_types * max_n_atoms_per_residue * 3
+        if structure_context_mask is not None:
+            coord_feat *= structure_context_mask[:, :, None]
 
         # dihedral embedding by applying angular encoding
         dihedral_feat = self.dihedral_embedding(dihedrals)
+        if structure_context_mask is not None:
+            dihedral_mask = torch.stack(
+                [
+                    torch.roll(structure_context_mask, shifts=s, dims=1)
+                    for s in range(-1, 1)
+                ]
+            ).all(axis=0)
+            dihedral_feat *= dihedral_mask[:, :, None]
 
         # chain embedding
         chain_feat = self.chain_embedding(chain_idx)  # bsz, L, d_feat
@@ -168,15 +193,13 @@ class PairEmbedding(nn.Module):
         self.d_feat = d_feat
         self.max_dist_to_consider = max_dist_to_consider
 
-        self.max_n_amino_acid_types = 20  # TODO: why 22?
-        self.amino_acid_type_pair_embedding = nn.Embedding(
-            self.max_n_amino_acid_types**2, d_feat
-        )
+        self.max_n_aa_types = 21  # TODO: why 22?
+        self.aa_pair_type_embedding = nn.Embedding(self.max_n_aa_types**2, d_feat)
 
         self.relpos_embedding = nn.Embedding(2 * max_dist_to_consider + 1, d_feat)
 
         self.pair2distcoef = nn.Embedding(
-            self.max_n_amino_acid_types**2, max_n_atoms_per_residue**2
+            self.max_n_aa_types**2, max_n_atoms_per_residue**2
         )
         nn.init.zeros_(self.pair2distcoef.weight)
         self.distance_embedding = nn.Sequential(
@@ -199,28 +222,43 @@ class PairEmbedding(nn.Module):
 
     def forward(
         self,
-        seq: torch.Tensor,
-        residue_idx: torch.Tensor,
-        chain_idx: torch.Tensor,
+        seq_idx: torch.Tensor,
         distmat: torch.Tensor,
         dihedrals: torch.Tensor,
+        residue_idx: torch.Tensor,
+        chain_idx: torch.Tensor,
         atom_mask: torch.Tensor,
+        structure_context_mask: torch.Tensor,
+        sequence_context_mask: torch.Tensor,
     ) -> torch.Tensor:
         """_summary_
 
         Args:
-            seq: Amino acid sequence. Shape: bsz, L
+            seq_idx: Amino acid sequence. Shape: bsz, L
             residue_idx: Residue index. Shape: bsz, L
             chain_idx: Chain index. Shape: bsz, L
             distmat: Inter-residue atom distances. Shape: bsz, L, L, A, A
             dihedrals: Inter-residue phi and psi angles. Shape: bsz, L, L, 2
             atom_mask: Whether an atom is valid for each residue. Shape: bsz, L, A
+            structure_context_mask: Whether a residue is in the structural context.
+                Shape: bsz, L
+            sequence_context_mask: Whether a residue is in the sequence context.
+                Shape: bsz, L
 
         Returns:
             Shape: bsz, L, L, d_feat
         """
-        bsz, L = seq.shape
+        bsz, L = seq_idx.shape
         CA_IDX = 1
+
+        if structure_context_mask is not None:
+            pair_structure_context_mask = (
+                structure_context_mask[:, :, None] * structure_context_mask[:, None, :]
+            )
+        if sequence_context_mask is not None:
+            pair_sequence_context_mask = (
+                sequence_context_mask[:, :, None] * sequence_context_mask[:, None, :]
+            )
 
         atom_mask_pair = atom_mask[:, :, None, :, None] * atom_mask[:, None, :, None, :]
         atom_mask_pair = rearrange(
@@ -228,31 +266,42 @@ class PairEmbedding(nn.Module):
         )  # bsz, L, L, A * A
 
         residue_mask = atom_mask[:, :, CA_IDX]  # bsz, L
-        residue_mask_pair = residue_mask[:, :, None] * residue_mask[:, None, :]  # bsz, L, L
+        residue_mask_pair = (
+            residue_mask[:, :, None] * residue_mask[:, None, :]
+        )  # bsz, L, L
 
         # amino acid type pair embedding
-        seq_pair = seq[:, :, None] * self.max_n_amino_acid_types + seq[:, None, :]
-        seq_pair_feat = self.amino_acid_type_pair_embedding(seq_pair)  # bsz, L, L, d_feat
+        if sequence_context_mask is not None:  # fill non-context residues with UNK
+            _mask = sequence_context_mask.bool()
+            seq_idx = torch.where(_mask, seq_idx, torch.full_like(seq_idx, AA.UNK))
+
+        seq_pair = seq_idx[:, :, None] * self.max_n_aa_types + seq_idx[:, None, :]
+        seq_pair_feat = self.aa_pair_type_embedding(seq_pair)  # bsz, L, L, d_feat
 
         # relative 1D position embedding
         same_chain_mask = chain_idx[:, :, None] * chain_idx[:, None, :]
-
         relpos = residue_idx[:, :, None] - residue_idx[:, None, :]
         relpos = relpos.clamp(
             -self.max_dist_to_consider, self.max_dist_to_consider
         )  # bsz, L, L
-
         relpos_feat = self.relpos_embedding(relpos + self.max_dist_to_consider)
         relpos_feat = relpos_feat * same_chain_mask[:, :, :, None]
 
         # distance embedding
         coef = F.softplus(self.pair2distcoef(seq_pair))  # bsz, L, L, A * A
         distmat = rearrange(distmat, "b l1 l2 a1 a2 -> b l1 l2 (a1 a2)")
+
         distmat = torch.exp(-1 * coef * distmat**2)  # bsz, L, L, A * A
-        dist_feat = self.distance_embedding(distmat * atom_mask_pair)  # bsz, L, L, d_feat
+        dist_feat = self.distance_embedding(
+            distmat * atom_mask_pair
+        )  # bsz, L, L, d_feat
+        if structure_context_mask is not None:
+            distmat *= pair_structure_context_mask[:, :, :, None]
 
         # dihedral embedding
         dihedral_feat = self.dihedral_embedding(dihedrals)  # bsz, L, L, d_dihedral
+        if structure_context_mask is not None:
+            distmat *= pair_structure_context_mask[:, :, :, None]
 
         x = torch.cat(
             [
@@ -327,7 +376,9 @@ class InvariantPointAttentionLayer(nn.Module):
 
         if use_pair_bias:
             d_pair = d_orig * n_head
-            self.to_out = nn.Linear(d_scalar + d_pair + d_value_point + n_value_point, d_orig)
+            self.to_out = nn.Linear(
+                d_scalar + d_pair + d_value_point + n_value_point, d_orig
+            )
         else:
             self.to_out = nn.Linear(d_scalar + d_value_point + n_value_point, d_orig)
 
@@ -363,7 +414,8 @@ class InvariantPointAttentionLayer(nn.Module):
 
         # standard self-attention (scalar attention)
         logit_scalar = (
-            einsum("b n i d, b n j d -> b n i j", q_scalar, k_scalar) * self.scale_scalar
+            einsum("b n i d, b n j d -> b n i j", q_scalar, k_scalar)
+            * self.scale_scalar
         )
 
         # modulation by pair representation
@@ -377,7 +429,10 @@ class InvariantPointAttentionLayer(nn.Module):
         gamma = rearrange(self.gamma, "n -> () n () ()")
 
         logit_point = (
-            -0.5 * self.scale_point * gamma * (all_pairwise_diff**2).sum(dim=-1).sum(dim=-1)
+            -0.5
+            * self.scale_point
+            * gamma
+            * (all_pairwise_diff**2).sum(dim=-1).sum(dim=-1)
         )
 
         if self.use_pair_bias:
@@ -503,7 +558,6 @@ class Denoiser(nn.Module):
         res_emb: torch.Tensor,
         pair_emb: torch.Tensor,
         beta: torch.Tensor,
-        generation_mask: torch.Tensor,
         residue_mask: torch.Tensor,
     ) -> torch.Tensor:
         bsz, n_residues = s_t.shape[:2]
@@ -536,7 +590,7 @@ class Denoiser(nn.Module):
 
         out = {
             "xyz_eps": x_epsilon,
-            "rotmat_t0": o_denoised,
+            "orientations_t0": o_denoised,
             "seq_posterior": s_denoised_prob,
         }
 
@@ -548,10 +602,14 @@ class OrientationLoss(nn.Module):
         super().__init__()
         self.reduction = reduction
 
-    def forward(self, pred_rotmat: torch.Tensor, target_rotmat: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pred_rotmat: torch.Tensor, target_rotmat: torch.Tensor
+    ) -> torch.Tensor:
         device = pred_rotmat.device
 
-        rot_discrepancy = einsum("b l i j, b l i k -> b l j k", pred_rotmat, target_rotmat)
+        rot_discrepancy = einsum(
+            "b l i j, b l i k -> b l j k", pred_rotmat, target_rotmat
+        )
         eye = torch.eye(3).to(device).expand_as(rot_discrepancy)
 
         return F.mse_loss(rot_discrepancy, eye, reduction=self.reduction)
@@ -569,15 +627,17 @@ class DiffAb(pl.LightningModule):
         T=100,
         s=0.01,
         beta_max=0.999,
-        max_atoms_per_residue=25,
+        max_atoms_per_residue=15,
         max_dist_to_consider=32,
     ):
         super().__init__()
 
-        self.residue_embedding = ResidueEmbedding(
+        self.sched = cosine_variance_schedule(T=T, s=s, beta_max=beta_max)
+
+        self.residue_context_embedding = ResidueEmbedding(
             max_n_atoms_per_residue=max_atoms_per_residue, d_feat=d_emb
         )
-        self.pair_embedding = PairEmbedding(
+        self.pair_context_embedding = PairEmbedding(
             max_n_atoms_per_residue=max_atoms_per_residue,
             d_feat=d_emb,
             max_dist_to_consider=max_dist_to_consider,
@@ -600,31 +660,101 @@ class DiffAb(pl.LightningModule):
         self.coordinate_loss = nn.MSELoss()
         self.orientation_loss = OrientationLoss()
 
-    def forward(self, batch):
-        xyz = batch["xyz"]
-        atom_mask = batch["atom_mask"]
-        seq = batch["seq"]
-        chain_idx, chain_ids = batch["chain_idx"], batch["chain_ids"]
-
-        sb = StructureBatch.from_xyz(xyz, atom_mask)
-        backbone_dihedrals = sb.backbone_dihedrals()  # b n 3 3
-        orientation = sb.backbone_orientations()
-
-        res_emb = self.residue_embedding(
-            seq, xyz, backbone_dihedrals, chain_idx, orientation, atom_mask
+    def encode_context(
+        self,
+        seq_idx_t0,  # b n
+        xyz_t0,  # b n a 3
+        orientations_t0,  # b n 3 3
+        backbone_dihedrals,  # b n 3
+        distmat,  # b n n a a
+        pairwise_dihedrals,  # b n n 2
+        atom_mask,  # b n a
+        chain_idx,  # b n
+        residue_idx,  # b n
+        structure_context_mask,  # b n
+        sequence_context_mask,  # b n
+    ):
+        res_emb = self.residue_context_embedding(
+            seq_idx_t0,
+            xyz_t0,
+            orientations_t0,
+            backbone_dihedrals,
+            chain_idx,
+            atom_mask,
+            structure_context_mask,
+            sequence_context_mask,
         )
 
-        residue_idx = batch["residue_idx"]
-
-        distmat = sb.pairwise_distance_matrix()
-
-        phi = sb.pairwise_dihedrals(atoms_i=["C"], atoms_j=["N", "CA", "C"])
-        psi = sb.pairwise_dihedrals(atoms_i=["N", "CA", "C"], atoms_j=["N"])
-        pairwise_dihedrals = torch.stack([phi, psi], dim=-1)
-
-        pair_emb = self.pair_embedding(
-            seq, residue_idx, chain_idx, distmat, pairwise_dihedrals, atom_mask
+        pair_emb = self.pair_context_embedding(
+            seq_idx_t0,
+            distmat,
+            pairwise_dihedrals,
+            residue_idx,
+            chain_idx,
+            atom_mask,
+            structure_context_mask,
+            sequence_context_mask,
         )
+
+        return res_emb, pair_emb
+
+    def forward(
+        self,
+        seq_t,
+        xyz_t,
+        orientations_t,
+        beta,
+        atom_mask,
+        structure_context_mask,
+        sequence_context_mask,
+        residue_mask,
+        chain_idx,
+        residue_idx,
+    ):
+        # save CA-centered translation vectors for each residue
+        translations_t = xyz_t[:, :, ATOM.CA]  # b n 3
+
+        # instantiate a StructureBatch for convenient handling of
+        # protein backbone geometric features
+        sb = StructureBatch.from_backbone_orientations_translations(
+            orientations_t,
+            translations_t,
+        )
+
+        bb_dih, bb_dih_mask = sb.backbone_dihedrals()  # b n 3
+        res_emb = self.residue_context_embedding(
+            seq_t,
+            xyz_t,
+            bb_dih,
+            chain_idx,
+            orientations_t,
+            atom_mask,
+            structure_context_mask,
+            sequence_context_mask,
+        )  # b n d_emb
+
+        # residue-pair features
+        distmat, distmat_mask = sb.pairwise_distance_matrix()
+
+        phi = sb.pairwise_dihedrals(atoms_i=["C"], atoms_j=["N", "CA", "C"])  # b n n
+        psi = sb.pairwise_dihedrals(atoms_i=["N", "CA", "C"], atoms_j=["N"])  # b n n
+        pairwise_dihedrals = torch.stack([phi, psi], dim=-1)  # b n n 2
+
+        pair_emb = self.pair_context_embedding(
+            seq_t, distmat, pairwise_dihedrals, residue_idx, chain_idx, atom_mask
+        )  # b n n d_emb
+
+        denoised_out = self.denoiser(
+            seq_t,
+            translations_t,
+            orientations_t,
+            res_emb,
+            pair_emb,
+            beta,
+            residue_mask,
+        )  # seq_posterior, xyz_eps, rotmat_t0
+
+        return denoised_out
 
     def training_step(self, batch, batch_idx):
         device = batch.device
@@ -632,29 +762,46 @@ class DiffAb(pl.LightningModule):
 
         # sample t from [1, T]. Shape: bsz,
         t = torch.randint(low=1, high=self.T + 1, size=(bsz,)).to(device)
+        # get corresponding beta from the variance schedule. Shape: bsz,
+        beta = self.sched["beta"][t]
 
         # sample noisy sequence at timestep t.
-        seq_t0 = batch["seq"]
-        seq_t, seq_posterior = self.seq_diffuser.diffuse_from_t0(
-            seq_t0, t, return_posterior=True
+        seq_idx_t0 = batch["seq_idx"]  # b n
+        seq_idx_t, seq_posterior = self.seq_diffuser.diffuse_from_t0(
+            seq_idx_t0=seq_idx_t0, t=t, return_posterior=True
         )
 
         # sample noisy coordinates at timestep t.
-        xyz_t0 = batch["xyz"]
-        xyz_t, xyz_eps = self.coordinate_diffuser.diffuse_from_t0(xyz_t0, t, return_eps=True)
+        xyz_t0 = batch["xyz"]  # b n a 3
+        translations_t0 = xyz_t0[:, :, ATOM.CA]  # b n 3
+        xyz_t, xyz_eps = self.coordinate_diffuser.diffuse_from_t0(
+            xyz_t0=translations_t0, t=t, return_eps=True
+        )
 
         # sample noisy orientations at timestep t.
-        rotmat_t0 = batch["rotmat"]
-        rotmat_t = self.orientation_diffuser.diffuse_from_t0(rotmat_t0, t)
+        orientations_t0 = batch["orientations"]  # b n 3 3
+        orientations_t = self.orientation_diffuser.diffuse_from_t0(
+            o=orientations_t0, t=t
+        )
 
         # predict sequence posterior probs at timestep t-1 (`seq_posterior`),
-        # noise added to xyz (`xyz_eps`), and orientation at timestep t0 (`rotmat_t0`)
-        out = self.forward(seq_t, xyz_t, rotmat_t)
+        # noise added to xyz (`xyz_eps`), and orientation at timestep t0 (`orientations_t0`)
+        out = self.forward(
+            seq_idx_t,
+            xyz_t,
+            orientations_t,
+            beta=beta,
+            atom_mask=batch["atom_mask"],
+            generation_mask=batch["generation_mask"],
+            residue_mask=batch["residue_mask"],
+            chain_idx=batch["chain_idx"],
+            residue_idx=batch["residue_idx"],
+        )
 
         # compute loss
         seq_loss = self.aa_loss(out["seq_posterior"].log(), seq_posterior)
         xyz_loss = self.coordinate_loss(out["xyz_eps"], xyz_eps)
-        rotmat_loss = self.orientation_loss(out["rotmat_t0"], rotmat_t0)
+        rotmat_loss = self.orientation_loss(out["orientations_t0"], orientations_t0)
 
         loss = seq_loss + xyz_loss + rotmat_loss
 

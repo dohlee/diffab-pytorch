@@ -42,28 +42,28 @@ class SequenceDiffuser(object):
     def __init__(self, T, s=0.01, beta_max=0.999):
         self.sched = cosine_variance_schedule(T, s=s, beta_max=beta_max)
 
-    def forward_prob_single_step(self, seq, t):
+    def forward_prob_single_step(self, seq_idx, t):
         """
         Compute the probability of each amino acid at timestep t,
         given the sequence at timestep t-1.
 
-        seq (torch.LongTensor): bsz, L
+        seq_idx (torch.LongTensor): bsz, L
         t (int): timestep
         """
-        seq = F.one_hot(seq)
+        seq_onehot = F.one_hot(seq_idx)
         w_seq = 1 - self.sched["beta"][t]
 
-        unif_noise = torch.ones_like(seq) / 20.0
+        unif_noise = torch.ones_like(seq_onehot) / 20.0
         w_unif_noise = self.sched["beta"][t]
 
-        return weighted_multinomial(seq, unif_noise, w_seq, w_unif_noise)
+        return weighted_multinomial(seq_onehot, unif_noise, w_seq, w_unif_noise)
 
-    def diffuse_single_step(self, seq, t):
+    def diffuse_single_step(self, seq_idx, t):
         """ """
-        p = self.forward_prob_single_step(seq, t)
+        p = self.forward_prob_single_step(seq_idx, t)
         return torch.multinomial(p.view(-1, 20), num_samples=1).view(p.shape[:-1])
 
-    def forward_prob_from_t0(self, seq_t0, t):
+    def forward_prob_from_t0(self, seq_idx_t0, t):
         """
         Compute the probability of each amino acid at timestep t,
         given the sequence at timestep 0.
@@ -72,33 +72,33 @@ class SequenceDiffuser(object):
         t (int): timestep
         """
 
-        seq = F.one_hot(seq_t0)
+        seq_onehot_t0 = F.one_hot(seq_idx_t0)
         w_seq = self.sched["alpha_bar"][t]
 
-        unif_noise = torch.ones_like(seq) / 20.0
+        unif_noise = torch.ones_like(seq_onehot_t0) / 20.0
         w_unif_noise = 1 - self.sched["alpha_bar"][t]
 
-        return weighted_multinomial(seq, unif_noise, w_seq, w_unif_noise)
+        return weighted_multinomial(seq_onehot_t0, unif_noise, w_seq, w_unif_noise)
 
     def diffuse_from_t0(
-        self, seq_t0: torch.Tensor, t: int, return_posterior: bool = True
+        self, seq_idx_t0: torch.Tensor, t: int, return_posterior: bool = True
     ) -> torch.Tensor:
         """Sample a sequence at timestep t, given the sequence at timestep 0.
 
         Args:
-            seq_t0 (torch.Tensor): Sequence at timestep 0. Shape: bsz, L
-            t (int): Timestep
+            seq_idx_t0: Sequence at timestep 0. Shape: bsz, L
+            t: Timestep
             return_posterior (bool, optional): Whether to return the
                 posterior probability. Defaults to True.
 
         Returns:
             torch.Tensor: Sequence at timestep t. Shape: bsz, L
         """
-        p = self.forward_prob_from_t0(seq_t0, t)
+        p = self.forward_prob_from_t0(seq_idx_t0, t)
         seq_t = torch.multinomial(p.view(-1, 20), num_samples=1).view(p.shape[:-1])
 
         if return_posterior:
-            posterior = self.posterior_single_step(seq_t, seq_t0, t)
+            posterior = self.posterior_single_step(seq_t, seq_idx_t0, t)
             return seq_t, posterior
         else:
             return seq_t
@@ -115,7 +115,9 @@ class SequenceDiffuser(object):
 
         TODO: See if normalizing with self.diffuse_from_t0(seq_t0, t) gives better performance.
         """
-        p = self.forward_prob_single_step(seq_t, t) * self.forward_prob_from_t0(seq_t0, t - 1)
+        p = self.forward_prob_single_step(seq_t, t) * self.forward_prob_from_t0(
+            seq_t0, t - 1
+        )
 
         return p / p.sum(dim=-1, keepdim=True)
 
