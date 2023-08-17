@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import diffab_pytorch.so3 as so3
+from einops import rearrange
 
 
 def cosine_variance_schedule(T, s=8e-3, beta_max=0.999):
@@ -35,6 +36,8 @@ def cosine_variance_schedule(T, s=8e-3, beta_max=0.999):
 
 
 def weighted_multinomial(p1, p2, w1, w2):
+    w1 = rearrange(w1, "b -> b () ()")
+    w2 = rearrange(w2, "b -> b () ()")
     return w1 * p1 + w2 * p2
 
 
@@ -42,46 +45,97 @@ class SequenceDiffuser(object):
     def __init__(self, T, s=0.01, beta_max=0.999):
         self.sched = cosine_variance_schedule(T, s=s, beta_max=beta_max)
 
-    def forward_prob_single_step(self, seq_idx, t):
-        """
-        Compute the probability of each amino acid at timestep t,
+    def forward_prob_single_step(
+        self,
+        seq_idx: torch.LongTensor,
+        t: torch.LongTensor,
+        generation_mask: torch.BoolTensor,
+    ) -> torch.FloatTensor:
+        """Compute the probability of each amino acid at timestep t,
         given the sequence at timestep t-1.
 
-        seq_idx (torch.LongTensor): bsz, L
-        t (int): timestep
+        Args:
+            seq_idx: Sequence index. Shape: (bsz, L)
+            t: Timestep. Shape: (bsz,)
+            generation_mask: Mask for residues for which noise to be added.
+                Shape: (bsz, L)
+
+        Returns:
+            seq_idx_noised: A tensor representing noised amino acid probabilities.
+                Shape: (bsz, L)
         """
         seq_onehot = F.one_hot(seq_idx)
-        w_seq = 1 - self.sched["beta"][t]
+        w_orig = 1 - self.sched["beta"][t]
 
         unif_noise = torch.ones_like(seq_onehot) / 20.0
-        w_unif_noise = self.sched["beta"][t]
+        w_noise = self.sched["beta"][t]
 
-        return weighted_multinomial(seq_onehot, unif_noise, w_seq, w_unif_noise)
+        seq_onehot_noised = weighted_multinomial(
+            seq_onehot, unif_noise, w_orig, w_noise
+        )
 
-    def diffuse_single_step(self, seq_idx, t):
-        """ """
-        p = self.forward_prob_single_step(seq_idx, t)
+        _mask = generation_mask.unsqueeze(-1).expand_as(seq_onehot)
+        return torch.where(_mask, seq_onehot_noised, seq_onehot)
+
+    def diffuse_single_step(
+        self,
+        seq_idx: torch.LongTensor,
+        t: torch.LongTensor,
+        generation_mask: torch.BoolTensor,
+    ) -> torch.LongTensor:
+        """Take a single diffusion step and return a batch of noised sequence.
+
+        Args:
+            seq_idx: Sequence index. Shape: (bsz, L)
+            t: Timestep. Shape: (bsz,)
+            generation_mask: Mask for residues for which noise to be added.
+                Shape: (bsz, L)
+
+        Returns:
+            seq_noised: A sequence index tensor sampled from noised amino acid
+                probability distributions. Shape: (bsz, L)
+        """
+        p = self.forward_prob_single_step(seq_idx, t, generation_mask)
         return torch.multinomial(p.view(-1, 20), num_samples=1).view(p.shape[:-1])
 
-    def forward_prob_from_t0(self, seq_idx_t0, t):
-        """
-        Compute the probability of each amino acid at timestep t,
+    def forward_prob_from_t0(
+        self,
+        seq_idx_t0: torch.LongTensor,
+        t: torch.LongTensor,
+        generation_mask: torch.BoolTensor,
+    ) -> torch.FloatTensor:
+        """Compute the probability of each amino acid at timestep t,
         given the sequence at timestep 0.
 
-        seq0 (torch.LongTensor): bsz, L
-        t (int): timestep
-        """
+        Args:
+            seq_idx_t0: Original sequence index. Shape: (bsz, L)
+            t: Timestep. Shape: (bsz,)
+            generation_mask: Mask for residues for which noise to be added.
+                Shape: (bsz, L)
 
+        Returns:
+            seq_idx_noised: A tensor representing noised amino acid probabilities.
+                Shape: (bsz, L)
+        """
         seq_onehot_t0 = F.one_hot(seq_idx_t0)
         w_seq = self.sched["alpha_bar"][t]
 
         unif_noise = torch.ones_like(seq_onehot_t0) / 20.0
-        w_unif_noise = 1 - self.sched["alpha_bar"][t]
+        w_noise = 1 - self.sched["alpha_bar"][t]
 
-        return weighted_multinomial(seq_onehot_t0, unif_noise, w_seq, w_unif_noise)
+        seq_onehot_noised = weighted_multinomial(
+            seq_onehot_t0, unif_noise, w_seq, w_noise
+        )
+
+        _mask = generation_mask.unsqueeze(-1).expand_as(seq_onehot_t0)
+        return torch.where(_mask, seq_onehot_noised, seq_onehot_t0)
 
     def diffuse_from_t0(
-        self, seq_idx_t0: torch.Tensor, t: int, return_posterior: bool = True
+        self,
+        seq_idx_t0: torch.LongTensor,
+        t: torch.LongTensor,
+        generation_mask: torch.BoolTensor,
+        return_posterior: bool = True,
     ) -> torch.Tensor:
         """Sample a sequence at timestep t, given the sequence at timestep 0.
 
@@ -94,31 +148,41 @@ class SequenceDiffuser(object):
         Returns:
             torch.Tensor: Sequence at timestep t. Shape: bsz, L
         """
-        p = self.forward_prob_from_t0(seq_idx_t0, t)
-        seq_t = torch.multinomial(p.view(-1, 20), num_samples=1).view(p.shape[:-1])
+        p = self.forward_prob_from_t0(seq_idx_t0, t, generation_mask)
+        seq_idx_t = torch.multinomial(p.view(-1, 20), num_samples=1).view(p.shape[:-1])
 
         if return_posterior:
-            posterior = self.posterior_single_step(seq_t, seq_idx_t0, t)
-            return seq_t, posterior
+            posterior = self.posterior_single_step(
+                seq_idx_t, seq_idx_t0, t, generation_mask
+            )
+            return seq_idx_t, posterior
         else:
-            return seq_t
+            return seq_idx_t
 
     def posterior_single_step(
-        self, seq_t: torch.Tensor, seq_t0: torch.Tensor, t: int
-    ) -> torch.Tensor:
-        """
-        Compute the posterior probability of each amino acid at timestep t-1,
+        self,
+        seq_idx_t: torch.LongTensor,
+        seq_idx_t0: torch.LongTensor,
+        t: torch.LongTensor,
+        generation_mask: torch.BoolTensor,
+    ) -> torch.FloatTensor:
+        """Compute the posterior probability of each amino acid at timestep t-1,
         given the sequence at timestep t.
 
-        seq (torch.LongTensor): bsz, L
-        t (int): timestep
+        Args:
+            seq_idx_t: Shape: (bsz, L)
+            seq_idx_t0: Shape: (bsz, L)
+            t: Shape: (bsz,)
+            generation_mask: Shape: (bsz, L)
 
+        Returns:
+            seq_posterior: Shape: (bsz, L)
         TODO: See if normalizing with self.diffuse_from_t0(seq_t0, t) gives better performance.
         """
-        p = self.forward_prob_single_step(seq_t, t) * self.forward_prob_from_t0(
-            seq_t0, t - 1
-        )
+        p_single = self.forward_prob_single_step(seq_idx_t, t, generation_mask)
+        p_from_t0 = self.forward_prob_from_t0(seq_idx_t0, t - 1, generation_mask)
 
+        p = p_single * p_from_t0
         return p / p.sum(dim=-1, keepdim=True)
 
 
@@ -127,29 +191,40 @@ class CoordinateDiffuser(object):
         self.sched = cosine_variance_schedule(T, s=s, beta_max=beta_max)
 
     def diffuse_from_t0(
-        self, xyz_t0: torch.Tensor, t: int, return_eps: bool = True
+        self,
+        translations_t0: torch.FloatTensor,
+        t: torch.LongTensor,
+        generation_mask: torch.BoolTensor,
+        return_eps: bool = True,
     ) -> torch.Tensor:
         """Sample a coordinate at timestep t, given the coordinate at timestep 0.
 
         Args:
-            xyz_t0 (torch.Tensor): Coordinate at timestep 0. Shape: bsz, L, 3
-            t (int): Timestep
-            return_eps (bool, optional):
-                Whether to return noise added to the coordinate. Defaults to True.
+            translations_t0: Translation vectors of residue frames at timestep 0.
+                Shape: bsz, L, 3
+            t: Timestep. Shape: bsz,
+            generation_mask: Shape: bsz, L
+            return_eps: Whether to return noise added to the coordinate.
+                Defaults to True.
 
         Returns:
-            torch.Tensor: Sampled coordinate at timestep t. Shape: bsz, L, 3
+            Sampled coordinate at timestep t. Shape: bsz, L, 3
         """
         alpha_bar_sqrt = self.sched["alpha_bar_sqrt"][t]
         one_minus_alpha_bar_sqrt = self.sched["one_minus_alpha_bar_sqrt"][t]
 
-        eps = torch.randn_like(xyz_t0)
-        xyz_t = alpha_bar_sqrt * xyz_t0 + one_minus_alpha_bar_sqrt * eps
+        eps = torch.randn_like(translations_t0)
+        translations_t = (
+            alpha_bar_sqrt * translations_t0 + one_minus_alpha_bar_sqrt * eps
+        )
+
+        _mask = generation_mask.unsqueeze(-1)
+        translations_t = torch.where(_mask, translations_t, translations_t0)
 
         if return_eps:
-            return xyz_t, eps
+            return translations_t, eps
         else:
-            return xyz_t
+            return translations_t
 
 
 class OrientationDiffuser(object):
@@ -175,22 +250,36 @@ class OrientationDiffuser(object):
             num_iters=1024,
         )
 
-    def diffuse_from_t0(self, o: torch.Tensor, t: int) -> torch.Tensor:
+    def diffuse_from_t0(
+        self,
+        orientations_t0: torch.FloatTensor,
+        generation_mask: torch.LongTensor,
+        t: torch.LongTensor,
+    ) -> torch.Tensor:
         """Sample an orientation at timestep t, given the orientation at timestep 0.
 
         Args:
-            o (torch.Tensor):
-                Orientation (i.e., rotation matrix) at timestep 0. Shape: bsz, L, 3, 3
-            t (int): Timestep
+            orientations_t0: Orientation (i.e., rotation matrix) at timestep 0.
+                Shape: bsz, L, 3, 3
+            generation_mask: True if a noise would be added to that residue.
+                0 otherwise. Shape: bsz, L
+            t (int): Timestep. Shape: bsz
 
         Returns:
-            torch.Tensor: Sampled orientation at timestep t. Shape: bsz, L, 3, 3
+            Sampled orientation at timestep t. Shape: bsz, L, 3, 3
         """
-        mean_orientation = so3.scale_rot(o, self.sched["alpha_bar_sqrt"][t])
+        mean_orientation = so3.scale_rot(
+            orientations_t0, self.sched["alpha_bar_sqrt"][t]
+        )
 
         # sample from isotropic Gaussian IGSO3(R, sqrt(1-a))
-        noise = so3.vector_to_rotation_matrix(
-            self.so3.sample_isotropic_gaussian(t)
-        )  # bsz, 3, 3
+        n_residues = orientations_t0.shape[1]
+        rotvec_sampled = self.so3.sample_isotropic_gaussian(t, num_samples=n_residues)
+        noise = so3.vector_to_rotation_matrix(rotvec_sampled)
 
-        return mean_orientation @ noise
+        orientations_t = torch.einsum("bnij,bnjk->bnik", mean_orientation, noise)
+
+        _mask = rearrange(generation_mask, "b l -> b l () ()")
+        orientations_t = torch.where(_mask, orientations_t, orientations_t0)
+
+        return orientations_t

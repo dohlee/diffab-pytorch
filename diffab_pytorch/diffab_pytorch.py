@@ -552,44 +552,49 @@ class Denoiser(nn.Module):
 
     def forward(
         self,
-        s_t: torch.Tensor,
-        x_t: torch.Tensor,
-        o_t: torch.Tensor,
-        res_emb: torch.Tensor,
-        pair_emb: torch.Tensor,
+        seq_idx_t: torch.Tensor,
+        translations_t: torch.Tensor,
+        orientations_t: torch.Tensor,
+        res_context_emb: torch.Tensor,
+        pair_context_emb: torch.Tensor,
         beta: torch.Tensor,
+        generation_mask: torch.Tensor,
         residue_mask: torch.Tensor,
     ) -> torch.Tensor:
-        bsz, n_residues = s_t.shape[:2]
+        bsz, n_residues = seq_idx_t.shape[:2]
 
-        # embed current sequence information to res_emb
-        s_emb = self.sequence_embedding(s_t)  # b n d_emb
-        res_emb = torch.cat([res_emb, s_emb], dim=-1)  # b n (d_emb * 2)
-        res_emb = self.to_res_emb(res_emb)  # b n d_emb
+        # embed current sequence information (s_t) to res_emb
+        s_emb = self.sequence_embedding(seq_idx_t)  # b n d_emb
+        res_context_emb = torch.cat([res_context_emb, s_emb], dim=-1)  # b n (d_emb * 2)
+        res_context_emb = self.to_res_emb(res_context_emb)  # b n d_emb
 
         # embed pair_emb to res_emb using Invariant Point Attention
-        res_emb = self.ipa(res_emb, pair_emb, o_t, x_t)
+        # NOTE: current orientation and translations are used to calculate attention between
+        # residue pairs
+        res_context_emb = self.ipa(
+            res_context_emb, pair_context_emb, orientations_t, translations_t
+        )
 
         # variance (or timepoint, equivalently) embedding
         t_emb = torch.stack([beta, torch.sin(beta), torch.cos(beta)], dim=-1)  # b 3
         t_emb = repeat(t_emb, "b d -> b n d", n=n_residues)  # b n 3
 
         # finalize residue embedding
-        res_emb = torch.cat([res_emb, t_emb], dim=-1)  # b n (d_emb + 3)
+        res_context_emb = torch.cat([res_context_emb, t_emb], dim=-1)  # b n (d_emb + 3)
 
         # denoise coordinates and predict epsilon
-        x_epsilon = self.coordinate_denoising(res_emb)  # b n 3
+        x_eps = self.coordinate_denoising(res_context_emb)  # b n 3
 
         # denoise orientations
-        v_epsilon = self.orientation_denoising(res_emb)  # b n 3
-        o_epsilon = vector_to_rotation_matrix(v_epsilon)  # b n 3 3
-        o_denoised = o_t @ o_epsilon  # b n 3 3
+        v_eps = self.orientation_denoising(res_context_emb)  # b n 3
+        o_eps = vector_to_rotation_matrix(v_eps)  # b n 3 3
+        o_denoised = orientations_t @ o_eps  # b n 3 3
 
         # denoise sequence probabilities
-        s_denoised_prob = self.sequence_denoising(res_emb)  # b n 20
+        s_denoised_prob = self.sequence_denoising(res_context_emb)  # b n 20
 
         out = {
-            "xyz_eps": x_epsilon,
+            "xyz_eps": x_eps,
             "orientations_t0": o_denoised,
             "seq_posterior": s_denoised_prob,
         }
@@ -674,7 +679,7 @@ class DiffAb(pl.LightningModule):
         structure_context_mask,  # b n
         sequence_context_mask,  # b n
     ):
-        res_emb = self.residue_context_embedding(
+        res_context_emb = self.residue_context_embedding(
             seq_idx_t0,
             xyz_t0,
             orientations_t0,
@@ -685,7 +690,7 @@ class DiffAb(pl.LightningModule):
             sequence_context_mask,
         )
 
-        pair_emb = self.pair_context_embedding(
+        pair_context_emb = self.pair_context_embedding(
             seq_idx_t0,
             distmat,
             pairwise_dihedrals,
@@ -696,61 +701,27 @@ class DiffAb(pl.LightningModule):
             sequence_context_mask,
         )
 
-        return res_emb, pair_emb
+        return res_context_emb, pair_context_emb
 
-    def forward(
+    def denoise(
         self,
-        seq_t,
-        xyz_t,
+        seq_idx_t,
+        translations_t,
         orientations_t,
+        res_context_emb,
+        pair_context_emb,
         beta,
-        atom_mask,
-        structure_context_mask,
-        sequence_context_mask,
+        generation_mask,
         residue_mask,
-        chain_idx,
-        residue_idx,
     ):
-        # save CA-centered translation vectors for each residue
-        translations_t = xyz_t[:, :, ATOM.CA]  # b n 3
-
-        # instantiate a StructureBatch for convenient handling of
-        # protein backbone geometric features
-        sb = StructureBatch.from_backbone_orientations_translations(
-            orientations_t,
-            translations_t,
-        )
-
-        bb_dih, bb_dih_mask = sb.backbone_dihedrals()  # b n 3
-        res_emb = self.residue_context_embedding(
-            seq_t,
-            xyz_t,
-            bb_dih,
-            chain_idx,
-            orientations_t,
-            atom_mask,
-            structure_context_mask,
-            sequence_context_mask,
-        )  # b n d_emb
-
-        # residue-pair features
-        distmat, distmat_mask = sb.pairwise_distance_matrix()
-
-        phi = sb.pairwise_dihedrals(atoms_i=["C"], atoms_j=["N", "CA", "C"])  # b n n
-        psi = sb.pairwise_dihedrals(atoms_i=["N", "CA", "C"], atoms_j=["N"])  # b n n
-        pairwise_dihedrals = torch.stack([phi, psi], dim=-1)  # b n n 2
-
-        pair_emb = self.pair_context_embedding(
-            seq_t, distmat, pairwise_dihedrals, residue_idx, chain_idx, atom_mask
-        )  # b n n d_emb
-
         denoised_out = self.denoiser(
-            seq_t,
+            seq_idx_t,
             translations_t,
             orientations_t,
-            res_emb,
-            pair_emb,
+            res_context_emb,
+            pair_context_emb,
             beta,
+            generation_mask,
             residue_mask,
         )  # seq_posterior, xyz_eps, rotmat_t0
 

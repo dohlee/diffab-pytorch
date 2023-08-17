@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from einops import rearrange
+from einops import rearrange, repeat
 from scipy.spatial.transform import Rotation
 
 
@@ -71,11 +71,11 @@ class SO3:
 
         return (a * b * c).sum(axis=0)
 
-    def sample_from_histogram(self, sigma_idx):
-        probs = self.histograms[sigma_idx]  # len(sigma_idx), n_bins
+    def sample_from_histogram(self, sigma_idx, num_samples):
+        probs = self.histograms[sigma_idx]  # n, n_bins
 
         # first sample bin according to the probability
-        bin_idx = torch.multinomial(probs, num_samples=1).flatten()
+        bin_idx = torch.multinomial(probs, num_samples=num_samples)
         binsize = torch.pi / self.n_bins
         bin_starts = torch.arange(0, torch.pi, binsize)
 
@@ -83,37 +83,47 @@ class SO3:
         sampled = bin_starts[bin_idx] + binsize * torch.rand(bin_idx.shape)
         return sampled
 
-    def sample_from_gaussian(self, sigma_idx):
+    def sample_from_gaussian(self, sigma_idx, num_samples):
         mu = self.sigmas_to_consider[sigma_idx] * 2.0
         std = self.sigmas_to_consider[sigma_idx]
+
+        mu = repeat(mu, "n -> n s", s=num_samples)
+        std = repeat(std, "n -> n s", s=num_samples)
 
         sampled = mu + std * torch.randn_like(mu)
         sampled = sampled % torch.pi  # truncate to [0, pi)
 
         return sampled
 
-    def sample_isotropic_gaussian(self, sigma_idx):
-        n = len(sigma_idx)
-        #
-        # Sample rotational axis from uniform distribution on S^2 (unit sphere).
-        #
+    def sample_isotropic_gaussian(
+        self, sigma_idx: torch.LongTensor, num_samples: int
+    ) -> torch.FloatTensor:
+        """Sample from isotropic Gaussian distribution on SO(3).
+
+        Args:
+            sigma_idx: Shape: (bsz,)
+            num_samples: Number of samples to draw for each of `sigma_idx`.
+
+        Returns:
+            _type_: _description_
+        """
+        # Sample rotational axis `u`` from uniform distribution on S^2 (unit sphere).
         # This can be effectively done by sampling 3D standard Gaussian and
         # normalizing the sampled vector to unit length
-        u = F.normalize(torch.randn(n, 3), dim=-1)  # n, 3
+        n_variances = len(sigma_idx)
+        u = F.normalize(torch.randn(n_variances, num_samples, 3), dim=-1)  # n s 3
 
-        #
         # Sample rotation angle
-        #
-        # from histogram
-        theta_hist = self.sample_from_histogram(sigma_idx)
-
-        # from Gaussian distribution
-        theta_gaussian = self.sample_from_gaussian(sigma_idx)
-
+        # 1) from histogram,
+        theta_hist = self.sample_from_histogram(sigma_idx, num_samples)
+        # 2) or from Gaussian distribution
+        theta_gaussian = self.sample_from_gaussian(sigma_idx, num_samples)
+        # choices are dependent on the value of sigma
         use_hist = self.sigmas_to_consider[sigma_idx] < self.sigma_threshold
-        theta = torch.where(use_hist, theta_hist, theta_gaussian)
+        use_hist = repeat(use_hist, "n -> n s", s=num_samples)
 
-        return u * theta[:, None]
+        theta = torch.where(use_hist, theta_hist, theta_gaussian)  # n s
+        return u * theta.unsqueeze(-1)
 
 
 def uniform(*size):
@@ -198,10 +208,10 @@ def vector_to_rotation_matrix(v: torch.Tensor) -> torch.Tensor:
     """Convert a vector v to a rotation matrix R.
 
     Args:
-        v (torch.Tensor): Shape: bsz, L, 3
+        v (torch.Tensor): Shape: *, 3
 
     Returns:
-        torch.Tensor: Shape: bsz, L, 3, 3
+        torch.Tensor: Shape: *, 3, 3
     """
     return exp_skew_symmetric_mat(vector_to_skew_symmetric_mat(v))
 
@@ -218,7 +228,7 @@ def exp_skew_symmetric_mat(S):
     v = skew_symmetric_mat_to_vector(S)
 
     norm = v.norm(dim=-1)
-    norm = rearrange(norm, "b l -> b l () ()")
+    norm = rearrange(norm, "... -> ... () ()")
 
     iden = torch.eye(3).to(S.device).expand_as(S)
 
@@ -227,10 +237,23 @@ def exp_skew_symmetric_mat(S):
     return R
 
 
-def scale_rot(R, k):
-    """
-    Scale a rotation matrix R by a scalar k.
+def scale_rot(R: torch.FloatTensor, k: torch.FloatTensor) -> torch.FloatTensor:
+    """Scale a rotation matrix R by a scalar k.
 
-    k (int): scalar
+    Args:
+        R: Shape: (*, 3, 3)
+        k: Shape: (*,)
+
+    Returns:
+        Shape: (*, 3, 3)
     """
+    if k.ndim > R.ndim:
+        raise ValueError(
+            f"Dimension of k ({k.ndim}) cannot be larger than that of R ({R.ndim})"
+        )
+
+    ndim_to_expand = R.ndim - k.ndim
+    for _ in range(ndim_to_expand):
+        k = k.unsqueeze(-1)
+
     return exp_skew_symmetric_mat(k * log_rotmat(R))

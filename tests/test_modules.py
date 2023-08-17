@@ -225,16 +225,23 @@ def test_Denoiser():
     generation_mask = torch.randint(0, 2, (bsz, n_residues))
     residue_mask = torch.randint(0, 2, (bsz, n_residues))
 
-    s_t = torch.randint(0, 20, (bsz, n_residues))  # sequence
-    x_t = torch.rand(bsz, n_residues, 3)  # translations
-    o_t = torch.rand(bsz, n_residues, 3, 3)  # orientations
+    seq_idx_t = torch.randint(0, 20, (bsz, n_residues))  # sequence
+    translations_t = torch.rand(bsz, n_residues, 3)  # translations
+    orientations_t = torch.rand(bsz, n_residues, 3, 3)  # orientations
 
     out = denoiser(
-        s_t, x_t, o_t, res_emb, pair_emb, beta, generation_mask, residue_mask
+        seq_idx_t,
+        translations_t,
+        orientations_t,
+        res_emb,
+        pair_emb,
+        beta,
+        generation_mask,
+        residue_mask,
     )
 
     assert out["xyz_eps"].shape == (bsz, n_residues, 3)
-    assert out["rotmat_t0"].shape == (bsz, n_residues, 3, 3)
+    assert out["orientations_t0"].shape == (bsz, n_residues, 3, 3)
     assert out["seq_posterior"].shape == (bsz, n_residues, 20)
 
 
@@ -295,7 +302,7 @@ def test_DiffAb_encode_context():
     assert pair_emb.shape == (1, n_res, n_res, d_emb)
 
 
-def test_DiffAb():
+def test_DiffAb_denoise():
     d_emb = 32
     n_ipa_layers = 4
     d_scalar_per_head = 12
@@ -313,25 +320,62 @@ def test_DiffAb():
     )
 
     sb = StructureBatch.from_pdb_id("1REX")
+    seq_idx_t0 = sb.get_seq_idx()
+    xyz_t0 = sb.get_xyz()
+    orientations_t0 = sb.backbone_orientations()
+
+    backbone_dihedrals, _ = sb.backbone_dihedrals()
+    distmat, _ = sb.pairwise_distance_matrix()  # b n n a a
+    pairwise_dihedrals = torch.stack(
+        [
+            sb.pairwise_dihedrals(atoms_i=["C"], atoms_j=["N", "CA", "C"]),
+            sb.pairwise_dihedrals(atoms_i=["N", "CA", "C"], atoms_j=["N"]),
+        ],
+        dim=-1,
+    )  # b n n 2
+    atom_mask = sb.get_atom_mask()
+    chain_idx = sb.get_chain_idx()
     residue_idx = torch.arange(sb.get_max_n_residues()).unsqueeze(0)
 
-    seq_idx = sb.get_seq_idx()
-    assert seq_idx.shape == (1, sb.get_max_n_residues())
+    structure_context_mask = torch.randint(0, 2, (1, sb.get_max_n_residues()))
+    sequence_context_mask = torch.randint(0, 2, (1, sb.get_max_n_residues()))
 
-    xyz_t = sb.get_xyz()
-    assert xyz_t.shape == (1, sb.get_max_n_residues(), 15, 3)
-
-    orientations_t = sb.backbone_orientations()
-    assert orientations_t.shape == (1, sb.get_max_n_residues(), 3, 3)
-
-    out = diffab(
-        seq_t=seq_idx,
-        xyz_t=xyz_t,
-        orientations_t=orientations_t,
-        beta=torch.rand(1),
-        atom_mask=sb.get_atom_mask(),
-        generation_mask=torch.randint(0, 21, (1, sb.get_max_n_residues())),
-        residue_mask=torch.randint(0, 2, (1, sb.get_max_n_residues())),
-        chain_idx=sb.get_chain_idx(),
-        residue_idx=residue_idx,
+    res_context_emb, pair_context_emb = diffab.encode_context(
+        seq_idx_t0,
+        xyz_t0,
+        orientations_t0,
+        backbone_dihedrals,
+        distmat,
+        pairwise_dihedrals,
+        atom_mask,
+        chain_idx,
+        residue_idx,
+        structure_context_mask,
+        sequence_context_mask,
     )
+
+    n_res = sb.get_max_n_residues()
+    assert res_context_emb.shape == (1, n_res, d_emb)
+    assert pair_context_emb.shape == (1, n_res, n_res, d_emb)
+
+    seq_idx_t = torch.randint(0, 20, (1, n_res))
+    translations_t = torch.randn(1, n_res, 3)
+    orientations_t = torch.randn(1, n_res, 3, 3)
+    beta = torch.rand(1)
+    generation_mask = torch.randint(0, 2, (1, n_res)).bool()
+    residue_mask = torch.randint(0, 2, (1, n_res)).bool()
+
+    denoised_out = diffab.denoise(
+        seq_idx_t,
+        translations_t,
+        orientations_t,
+        res_context_emb,
+        pair_context_emb,
+        beta,
+        generation_mask,
+        residue_mask,
+    )
+
+    assert "xyz_eps" in denoised_out
+    assert "orientations_t0" in denoised_out
+    assert "seq_posterior" in denoised_out
