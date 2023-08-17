@@ -10,11 +10,7 @@ from diffab_pytorch.diffab_pytorch import (
     Denoiser,
     DiffAb,
 )
-
-from scipy.spatial.transform import Rotation as R
 from protstruc import StructureBatch
-from protstruc.general import ATOM
-import protstruc.geometry as geom
 
 
 def test_AngularEncoding():
@@ -240,12 +236,16 @@ def test_Denoiser():
         residue_mask,
     )
 
-    assert out["xyz_eps"].shape == (bsz, n_residues, 3)
+    assert out["translations_eps"].shape == (bsz, n_residues, 3)
     assert out["orientations_t0"].shape == (bsz, n_residues, 3, 3)
     assert out["seq_posterior"].shape == (bsz, n_residues, 20)
 
 
-def test_DiffAb_encode_context():
+@pytest.mark.parametrize(
+    ["generate_structure", "generate_sequence"],
+    [(True, True), (True, False), (False, True), (False, False)],
+)
+def test_DiffAb_encode_context(generate_structure, generate_sequence):
     d_emb = 32
     n_ipa_layers = 4
     d_scalar_per_head = 12
@@ -279,9 +279,8 @@ def test_DiffAb_encode_context():
     atom_mask = sb.get_atom_mask()
     chain_idx = sb.get_chain_idx()
     residue_idx = torch.arange(sb.get_max_n_residues()).unsqueeze(0)
-
-    structure_context_mask = torch.randint(0, 2, (1, sb.get_max_n_residues()))
-    sequence_context_mask = torch.randint(0, 2, (1, sb.get_max_n_residues()))
+    residue_mask = torch.randint(0, 2, (1, sb.get_max_n_residues()))
+    generation_mask = torch.randint(0, 2, (1, sb.get_max_n_residues()))
 
     res_emb, pair_emb = diffab.encode_context(
         seq_idx_t0,
@@ -293,8 +292,10 @@ def test_DiffAb_encode_context():
         atom_mask,
         chain_idx,
         residue_idx,
-        structure_context_mask,
-        sequence_context_mask,
+        generation_mask,
+        residue_mask,
+        generate_structure=generate_structure,
+        generate_sequence=generate_sequence,
     )
 
     n_res = sb.get_max_n_residues()
@@ -376,6 +377,6 @@ def test_DiffAb_denoise():
         residue_mask,
     )
 
-    assert "xyz_eps" in denoised_out
+    assert "translations_eps" in denoised_out
     assert "orientations_t0" in denoised_out
     assert "seq_posterior" in denoised_out

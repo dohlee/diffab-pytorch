@@ -1,72 +1,68 @@
+import os
 import torch
 import pytorch_lightning as pl
 
 from torch.utils.data import Dataset
-from diffab_pytorch.diffusion import (
-    SequenceDiffuser,
-    CoordinateDiffuser,
-)
+from protstruc import AntibodyFvStructureBatch
 
 
 class DiffAbDataset(Dataset):
-    def __init__(self, meta_df, T=100, s=0.01, beta_max=0.999):
+    def __init__(self, meta_df, data_dir):
         super().__init__()
 
         self.meta_df = meta_df
         self.records = meta_df.to_records()
-
-        self.T = T
-
-        self.seq_diffuser = SequenceDiffuser(
-            T=self.T,
-            s=s,
-            beta_max=beta_max,
-        )
-
-        self.coord_diffuser = CoordinateDiffuser(
-            T=self.T,
-            s=s,
-            beta_max=beta_max,
-        )
+        self.data_dir = data_dir
 
     def __len__(self):
         return len(self.meta_df)
 
     def __getitem__(self, i):
         record = self.records[i]
+        pdb_path = os.path.join(self.data_dir, f"{record.pdb_id}.pdb")
+
+        sb = AntibodyFvStructureBatch.from_pdb(pdb_path)
+        print(record.pdb_id, sb.get_max_n_residues())
+
+        backbone_dihedrals, backbone_dihedrals_mask = sb.backbone_dihedrals()
+        distmat, distmat_mask = sb.pairwise_distance_matrix()
+        pairwise_dihedrals = torch.stack(
+            [
+                sb.pairwise_dihedrals(atoms_i=["C"], atoms_j=["N", "CA", "C"]),
+                sb.pairwise_dihedrals(atoms_i=["N", "CA", "C"], atoms_j=["N"]),
+            ],
+            dim=-1,
+        )  # b n n 2
+
         ret = {}
+        ret["backbone_dihedrals"] = backbone_dihedrals
+        ret["backbone_dihedrals_mask"] = backbone_dihedrals_mask
+        ret["distmat"] = distmat
+        ret["distmat_mask"] = distmat_mask
+        ret["pairwise_dihedrals"] = pairwise_dihedrals
+        ret["atom_mask"] = sb.get_atom_mask()
+        ret["chain_idx"] = sb.get_chain_idx()
+        ret["residue_idx"] = torch.arange(sb.get_max_n_residues()).unsqueeze(0)
+        ret["residue_mask"] = sb.get_residue_mask()
 
-        # sample timepoint t from 0..T-1
-        t = torch.randint(0, self.T, (1,))
-        ret["t"] = t
-
-        #
-        # sequence
-        #
-        seq = record.seq
-        ret["seq"] = seq
-
-        # add appropriate noise to sequence
-        seq_t = self.seq_diffuser.diffuse_from_t0(record.seq, t=t)
-        ret["seq_noised"] = seq_t
-
-        seq_posterior_target = self.posterior_single_step(seq_t, record.seq, t=t)
-        ret["seq_posterior_target"] = seq_posterior_target
-
-        #
-        # Ca coordinate
-        #
-        xyz = record.xyz
-        ret["xyz"] = xyz
-
-        # add appropriate noise to coordinate and keep track of that noise
-        xyz_t, xyz_eps = self.coord_diffuser.diffuse_from_t0(record.xyz, t=t, return_eps=True)
-        ret["xyz_noised"] = xyz_t
-        ret["xyz_eps"] = xyz_eps
+        # TODO: determine mask for residues that are to be generated
+        ret["generation_mask"] = torch.randn(1, sb.get_max_n_residues())
 
         return ret
 
 
-class DiffAbDataModule(pl.LightningModule):
+class DiffAbDataModule(pl.LightningDataModule):
     def __init__(self):
         super().__init__()
+
+    def setup(self, stage=None):
+        pass
+
+    def train_dataloader(self):
+        pass
+
+    def val_dataloader(self):
+        pass
+
+    def test_dataloader(self):
+        pass
