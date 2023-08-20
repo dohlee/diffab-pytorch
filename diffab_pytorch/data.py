@@ -3,7 +3,7 @@ import torch
 import pytorch_lightning as pl
 
 from torch.utils.data import Dataset
-from protstruc import AntibodyFvStructureBatch
+from protstruc import AntibodyStructureBatch
 
 
 class DiffAbDataset(Dataset):
@@ -21,8 +21,12 @@ class DiffAbDataset(Dataset):
         record = self.records[i]
         pdb_path = os.path.join(self.data_dir, f"{record.pdb_id}.pdb")
 
-        sb = AntibodyFvStructureBatch.from_pdb(pdb_path)
-        print(record.pdb_id, sb.get_max_n_residues())
+        sb = AntibodyStructureBatch.from_pdb(
+            pdb_path,
+            heavy_chain_id=record.Hchain,
+            light_chain_id=record.Lchain,
+            antigen_chain_ids=record.antigen_chain,
+        )
 
         backbone_dihedrals, backbone_dihedrals_mask = sb.backbone_dihedrals()
         distmat, distmat_mask = sb.pairwise_distance_matrix()
