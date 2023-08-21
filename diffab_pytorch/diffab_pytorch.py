@@ -502,6 +502,7 @@ class Denoiser(nn.Module):
         n_query_point_per_head,
         n_value_point_per_head,
         n_head,
+        aa_vocab_size,
     ):
         super().__init__()
         self.sequence_embedding = nn.Embedding(25, d_emb)
@@ -543,7 +544,7 @@ class Denoiser(nn.Module):
             nn.ReLU(),
             nn.Linear(d_emb, d_emb),
             nn.ReLU(),
-            nn.Linear(d_emb, 20),
+            nn.Linear(d_emb, aa_vocab_size),
             nn.Softmax(dim=-1),
         )
 
@@ -588,7 +589,7 @@ class Denoiser(nn.Module):
         o_denoised = orientations_t @ o_eps  # b n 3 3
 
         # denoise sequence probabilities
-        s_denoised_prob = self.sequence_denoising(res_context_emb)  # b n 20
+        s_denoised_prob = self.sequence_denoising(res_context_emb)  # b n 21
 
         out = {
             "translations_eps": translations_eps,
@@ -630,14 +631,13 @@ class DiffAb(pl.LightningModule):
         s=0.01,
         beta_max=0.999,
         n_atoms=15,
+        aa_vocab_size=21,
         max_dist_to_consider=32,
     ):
         super().__init__()
 
         self.sched = cosine_variance_schedule(T=T, s=s, beta_max=beta_max)
-
         self.residue_context_embedding = ResidueEmbedding(n_atoms, d_emb)
-
         self.pair_context_embedding = PairEmbedding(
             n_atoms, d_emb, max_dist_to_consider
         )
@@ -649,15 +649,18 @@ class DiffAb(pl.LightningModule):
             n_query_point_per_head,
             n_value_point_per_head,
             n_head,
+            aa_vocab_size,
         )
 
-        self.seq_diffuser = SequenceDiffuser(T, s, beta_max)
+        self.seq_diffuser = SequenceDiffuser(T, s, beta_max, aa_vocab_size)
         self.coordinate_diffuser = CoordinateDiffuser(T, s, beta_max)
         self.orientation_diffuser = OrientationDiffuser(T, s, beta_max)
 
-        self.aa_loss = nn.KLDivLoss()
-        self.coordinate_loss = nn.MSELoss()
-        self.orientation_loss = OrientationLoss()
+        self.aa_loss = nn.KLDivLoss(reduction="none")
+        self.coordinate_loss = nn.MSELoss(reduction="none")
+        self.orientation_loss = OrientationLoss(reduction="none")
+
+        self.T = T
 
     def encode_context(
         self,
@@ -675,6 +678,8 @@ class DiffAb(pl.LightningModule):
         generate_structure: bool = True,
         generate_sequence: bool = True,
     ):
+        # marks context residues which will be only used for
+        # computing context embedding (i.e., not generated)
         context_mask = residue_mask & (~generation_mask)
         structure_context_mask = context_mask if generate_structure else None
         sequence_context_mask = context_mask if generate_sequence else None
@@ -713,7 +718,27 @@ class DiffAb(pl.LightningModule):
         beta,
         generation_mask,
         residue_mask,
-    ):
+    ) -> Dict[str, torch.Tensor]:
+        """Given a noisy sequence, translations and orientations at timestep t,
+        denoise them to obtain the sequence posterior, translations at timestep t0,
+        and orientations at timestep t0.
+
+        Args:
+            seq_idx_t: Noisy amino acid sequence. Shape: bsz, L
+            translations_t: Noisy Ca translations. Shape: bsz, L, 3
+            orientations_t: Noisy residue orientations. Shape: bsz, L, 3, 3
+            res_context_emb: Residue context embedding. Shape: bsz, L, d_emb
+            pair_context_emb: Residue-pair context embedding. Shape: bsz, L, L, d_emb
+            beta: Scheduled variances for diffusion. Shape: bsz
+            generation_mask: Whether a residue is generated. Shape: bsz, L
+            residue_mask: Whether a residue is valid. Shape: bsz, L
+
+        Returns:
+            A dictionary containing the following keys:
+                - seq_posterior:
+                - translations_eps: translations_eps,
+                - orientations_t0: o_denoised,
+        """
         denoised_out = self.denoiser(
             seq_idx_t,
             translations_t,
@@ -723,7 +748,7 @@ class DiffAb(pl.LightningModule):
             beta,
             generation_mask,
             residue_mask,
-        )  # seq_posterior, xyz_eps, rotmat_t0
+        )  # seq_posterior, translations_eps, orientations_t0
 
         return denoised_out
 
@@ -740,18 +765,21 @@ class DiffAb(pl.LightningModule):
         seq_idx_t0: torch.LongTensor,
         translations_t0: torch.FloatTensor,
         orientations_t0: torch.FloatTensor,
+        generation_mask: torch.BoolTensor,
         t: torch.LongTensor,
     ) -> Dict[str, torch.Tensor]:
         # sample noisy sequence at timestep t.
         seq_idx_t, seq_posterior = self.seq_diffuser.diffuse_from_t0(
-            seq_idx_t0, t, return_posterior=True
+            seq_idx_t0, t, generation_mask, return_posterior=True
         )
         # sample noisy coordinates at timestep t.
         translations_t, translations_eps = self.coordinate_diffuser.diffuse_from_t0(
-            translations_t0, t, return_eps=True
+            translations_t0, t, generation_mask, return_eps=True
         )
         # sample noisy orientations at timestep t.
-        orientations_t = self.orientation_diffuser.diffuse_from_t0(orientations_t0, t)
+        orientations_t = self.orientation_diffuser.diffuse_from_t0(
+            orientations_t0, generation_mask, t
+        )
 
         ret = {}
         ret["seq_idx_t"] = seq_idx_t
@@ -763,8 +791,8 @@ class DiffAb(pl.LightningModule):
         return ret
 
     def _shared_step(self, batch, batch_idx):
-        device = batch.device
-        bsz = batch.size(0)
+        device = batch["generation_mask"].device
+        bsz = batch["generation_mask"].size(0)
 
         # sample t from [1, T]. Shape: bsz,
         t = torch.randint(low=1, high=self.T + 1, size=(bsz,)).to(device)
@@ -776,8 +804,11 @@ class DiffAb(pl.LightningModule):
         xyz_t0 = batch["xyz"]
         translations_t0 = xyz_t0[:, :, ATOM.CA]
         orientations_t0 = batch["orientations"]
+        generation_mask = batch["generation_mask"]
 
-        noised = self._add_noise(seq_idx_t0, translations_t0, orientations_t0, t)
+        noised = self._add_noise(
+            seq_idx_t0, translations_t0, orientations_t0, generation_mask, t
+        )
 
         res_context_emb, pair_context_emb = self.encode_context(
             seq_idx_t0,
@@ -798,7 +829,7 @@ class DiffAb(pl.LightningModule):
         # and orientation at timestep t0 (`orientations_t0`)
         denoised = self.denoise(
             noised["seq_idx_t"],
-            noised["xyz_t"],
+            noised["translations_t"],
             noised["orientations_t"],
             res_context_emb,
             pair_context_emb,
@@ -815,8 +846,21 @@ class DiffAb(pl.LightningModule):
             denoised["translations_eps"], noised["translations_eps"]
         )
         orientations_loss = self.orientation_loss(
-            denoised["orientations_t0"], noised["orientations_t0"]
+            denoised["orientations_t0"], batch["orientations"]
         )
+
+        # apply masking to losses and average
+        loss_mask = batch["generation_mask"] & batch["residue_mask"]
+        loss_denom = loss_mask.sum()
+
+        seq_mask = rearrange(loss_mask, "b l -> b l ()")
+        seq_loss = (seq_loss * seq_mask).sum() / loss_denom
+
+        translations_mask = rearrange(loss_mask, "b l -> b l ()")
+        translations_loss = (translations_loss * translations_mask).sum() / loss_denom
+
+        orientations_mask = rearrange(loss_mask, "b l -> b l () ()")
+        orientations_loss = (orientations_loss * orientations_mask).sum() / loss_denom
 
         return seq_loss, translations_loss, orientations_loss
 

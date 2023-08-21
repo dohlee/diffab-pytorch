@@ -42,8 +42,9 @@ def weighted_multinomial(p1, p2, w1, w2):
 
 
 class SequenceDiffuser(object):
-    def __init__(self, T, s=0.01, beta_max=0.999):
+    def __init__(self, T, s=0.01, beta_max=0.999, aa_vocab_size=21):
         self.sched = cosine_variance_schedule(T, s=s, beta_max=beta_max)
+        self.aa_vocab_size = 21
 
     def forward_prob_single_step(
         self,
@@ -67,7 +68,7 @@ class SequenceDiffuser(object):
         seq_onehot = F.one_hot(seq_idx)
         w_orig = 1 - self.sched["beta"][t]
 
-        unif_noise = torch.ones_like(seq_onehot) / 20.0
+        unif_noise = torch.ones_like(seq_onehot) / self.aa_vocab_size
         w_noise = self.sched["beta"][t]
 
         seq_onehot_noised = weighted_multinomial(
@@ -96,7 +97,10 @@ class SequenceDiffuser(object):
                 probability distributions. Shape: (bsz, L)
         """
         p = self.forward_prob_single_step(seq_idx, t, generation_mask)
-        return torch.multinomial(p.view(-1, 20), num_samples=1).view(p.shape[:-1])
+        print(p.shape)
+        return torch.multinomial(p.view(-1, self.aa_vocab_size), num_samples=1).view(
+            p.shape[:-1]
+        )
 
     def forward_prob_from_t0(
         self,
@@ -120,7 +124,7 @@ class SequenceDiffuser(object):
         seq_onehot_t0 = F.one_hot(seq_idx_t0)
         w_seq = self.sched["alpha_bar"][t]
 
-        unif_noise = torch.ones_like(seq_onehot_t0) / 20.0
+        unif_noise = torch.ones_like(seq_onehot_t0) / self.aa_vocab_size
         w_noise = 1 - self.sched["alpha_bar"][t]
 
         seq_onehot_noised = weighted_multinomial(
@@ -149,7 +153,9 @@ class SequenceDiffuser(object):
             torch.Tensor: Sequence at timestep t. Shape: bsz, L
         """
         p = self.forward_prob_from_t0(seq_idx_t0, t, generation_mask)
-        seq_idx_t = torch.multinomial(p.view(-1, 20), num_samples=1).view(p.shape[:-1])
+        seq_idx_t = torch.multinomial(
+            p.view(-1, self.aa_vocab_size), num_samples=1
+        ).view(p.shape[:-1])
 
         if return_posterior:
             posterior = self.posterior_single_step(
@@ -212,6 +218,9 @@ class CoordinateDiffuser(object):
         """
         alpha_bar_sqrt = self.sched["alpha_bar_sqrt"][t]
         one_minus_alpha_bar_sqrt = self.sched["one_minus_alpha_bar_sqrt"][t]
+
+        alpha_bar_sqrt = rearrange(alpha_bar_sqrt, "b -> b () ()")
+        one_minus_alpha_bar_sqrt = rearrange(one_minus_alpha_bar_sqrt, "b -> b () ()")
 
         eps = torch.randn_like(translations_t0)
         translations_t = (

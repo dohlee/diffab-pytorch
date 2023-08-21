@@ -80,12 +80,15 @@ def collate_fn(batch):
     pairwise_dihedrals = torch.stack([phi, psi], dim=-1)  # b n n 2
 
     ret = {
+        "xyz": sb.get_xyz(),
+        "orientations": sb.backbone_orientations(),
         "backbone_dihedrals": backbone_dihedrals,
         "backbone_dihedrals_mask": backbone_dihedrals_mask,
         "distmat": distmat,
         "distmat_mask": distmat_mask,
         "pairwise_dihedrals": pairwise_dihedrals,
         "atom_mask": sb.get_atom_mask(),
+        "seq_idx": sb.get_seq_idx(),
         "chain_idx": sb.get_chain_idx(),
         "residue_idx": torch.arange(sb.get_max_n_residues()).unsqueeze(0),
         "residue_mask": sb.get_residue_mask(),
