@@ -584,8 +584,8 @@ class Denoiser(nn.Module):
         translations_eps = self.coordinate_denoising(res_context_emb)  # b n 3
 
         # denoise orientations
-        v_eps = self.orientation_denoising(res_context_emb)  # b n 3
-        o_eps = vector_to_rotation_matrix(v_eps)  # b n 3 3
+        v_eps = self.orientation_denoising(res_context_emb)  # b n 3, rotation vector
+        o_eps = vector_to_rotation_matrix(v_eps)  # b n 3 3, rotation matrix
         o_denoised = orientations_t @ o_eps  # b n 3 3
 
         # denoise sequence probabilities
@@ -633,6 +633,9 @@ class DiffAb(pl.LightningModule):
         n_atoms=15,
         aa_vocab_size=21,
         max_dist_to_consider=32,
+        lr=1e-4,
+        weight_decay=0.0,
+        betas=(0.9, 0.999),
     ):
         super().__init__()
 
@@ -661,6 +664,9 @@ class DiffAb(pl.LightningModule):
         self.orientation_loss = OrientationLoss(reduction="none")
 
         self.T = T
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.betas = betas
 
     def encode_context(
         self,
@@ -908,4 +914,9 @@ class DiffAb(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        pass
+        return torch.optim.Adam(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+            betas=self.betas,
+        )
