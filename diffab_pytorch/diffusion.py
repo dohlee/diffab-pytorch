@@ -65,7 +65,7 @@ class SequenceDiffuser(object):
             seq_idx_noised: A tensor representing noised amino acid probabilities.
                 Shape: (bsz, L)
         """
-        seq_onehot = F.one_hot(seq_idx)
+        seq_onehot = F.one_hot(seq_idx, num_classes=self.aa_vocab_size)
         w_orig = 1 - self.sched["beta"][t]
 
         unif_noise = torch.ones_like(seq_onehot) / self.aa_vocab_size
@@ -121,7 +121,7 @@ class SequenceDiffuser(object):
             seq_idx_noised: A tensor representing noised amino acid probabilities.
                 Shape: (bsz, L)
         """
-        seq_onehot_t0 = F.one_hot(seq_idx_t0)
+        seq_onehot_t0 = F.one_hot(seq_idx_t0, num_classes=self.aa_vocab_size)
         w_seq = self.sched["alpha_bar"][t]
 
         unif_noise = torch.ones_like(seq_onehot_t0) / self.aa_vocab_size

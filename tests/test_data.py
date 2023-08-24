@@ -29,7 +29,7 @@ def test_DiffAbDataset_batch_size_more_than_1():
     loader = DataLoader(
         ds, batch_size=4, shuffle=False, num_workers=4, collate_fn=collate_fn
     )
-    for batch in tqdm(loader, desc="testing DiffAbDataset-single batch size"):
+    for batch in tqdm(loader, desc="testing DiffAbDataset-batch size > 1"):
         pass
 
 

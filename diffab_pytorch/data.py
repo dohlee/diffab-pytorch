@@ -125,9 +125,12 @@ class DiffAbDataModule(pl.LightningDataModule):
         self.val_dataset = DiffAbDataset(
             self.val_df, self.data_dir, self.cdrs_to_generate
         )
-        self.test_dataset = DiffAbDataset(
-            self.test_df, self.data_dir, self.cdrs_to_generate
-        )
+        if self.test_df is not None:
+            self.test_dataset = DiffAbDataset(
+                self.test_df, self.data_dir, self.cdrs_to_generate
+            )
+        else:
+            self.test_dataset = None
 
     def train_dataloader(self):
         loader = torch.utils.data.DataLoader(
@@ -154,6 +157,9 @@ class DiffAbDataModule(pl.LightningDataModule):
         return loader
 
     def test_dataloader(self):
+        if self.test_df is None:
+            return None
+
         loader = torch.utils.data.DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
@@ -164,3 +170,18 @@ class DiffAbDataModule(pl.LightningDataModule):
             pin_memory=True,
         )
         return loader
+
+
+if __name__ == "__main__":
+    import tqdm
+    from torch.utils.data import DataLoader
+
+    dataset = DiffAbDataset(
+        meta_df=pd.read_csv("data/sabdab_summary_all.tsv", sep="\t"),
+        data_dir="data/all_structures/chothia",
+        cdrs_to_generate=["H3"],
+    )
+    loader = DataLoader(dataset, batch_size=1)
+
+    for _ in tqdm.tqdm(loader):
+        pass

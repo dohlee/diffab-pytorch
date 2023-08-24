@@ -339,7 +339,8 @@ def inverse_euclidean_transform(x, r, t):
 class InvariantPointAttentionLayer(nn.Module):
     def __init__(
         self,
-        d_orig,
+        d_residue_emb,
+        d_pair_emb,
         d_scalar_per_head=16,
         n_query_point_per_head=4,
         n_value_point_per_head=4,
@@ -352,32 +353,34 @@ class InvariantPointAttentionLayer(nn.Module):
 
         # standard self-attention (scalar attention)
         d_scalar = d_scalar_per_head * n_head
-        self.to_q_scalar = nn.Linear(d_orig, d_scalar, bias=False)
-        self.to_k_scalar = nn.Linear(d_orig, d_scalar, bias=False)
-        self.to_v_scalar = nn.Linear(d_orig, d_scalar, bias=False)
+        self.to_q_scalar = nn.Linear(d_residue_emb, d_scalar, bias=False)
+        self.to_k_scalar = nn.Linear(d_residue_emb, d_scalar, bias=False)
+        self.to_v_scalar = nn.Linear(d_residue_emb, d_scalar, bias=False)
         self.scale_scalar = d_scalar_per_head**-0.5
 
         # modulation by pair representation
         if self.use_pair_bias:
-            self.to_pair_bias = nn.Linear(d_orig, n_head, bias=False)
+            self.to_pair_bias = nn.Linear(d_pair_emb, n_head, bias=False)
 
         # point attention
         d_query_point = (n_query_point_per_head * 3) * n_head
         d_value_point = (n_value_point_per_head * 3) * n_head
         n_value_point = n_value_point_per_head * n_head
-        self.to_q_point = nn.Linear(d_orig, d_query_point, bias=False)
-        self.to_k_point = nn.Linear(d_orig, d_query_point, bias=False)
-        self.to_v_point = nn.Linear(d_orig, d_value_point, bias=False)
+        self.to_q_point = nn.Linear(d_residue_emb, d_query_point, bias=False)
+        self.to_k_point = nn.Linear(d_residue_emb, d_query_point, bias=False)
+        self.to_v_point = nn.Linear(d_residue_emb, d_value_point, bias=False)
         self.scale_point = (4.5 * n_query_point_per_head) ** -0.5
         self.gamma = nn.Parameter(torch.log(torch.exp(torch.ones(n_head)) - 1.0))
 
         if use_pair_bias:
-            d_pair = d_orig * n_head
+            d_pair = d_pair_emb * n_head
             self.to_out = nn.Linear(
-                d_scalar + d_pair + d_value_point + n_value_point, d_orig
+                d_scalar + d_pair + d_value_point + n_value_point, d_residue_emb
             )
         else:
-            self.to_out = nn.Linear(d_scalar + d_value_point + n_value_point, d_orig)
+            self.to_out = nn.Linear(
+                d_scalar + d_value_point + n_value_point, d_residue_emb
+            )
 
         self.num_independent_logits = 3 if use_pair_bias else 2
 
@@ -466,7 +469,8 @@ class InvariantPointAttentionModule(nn.Module):
     def __init__(
         self,
         n_layers,
-        d_orig,
+        d_residue_emb,
+        d_pair_emb,
         d_scalar_per_head,
         n_query_point_per_head,
         n_value_point_per_head,
@@ -476,7 +480,8 @@ class InvariantPointAttentionModule(nn.Module):
         self.layers = nn.ModuleList(
             [
                 InvariantPointAttentionLayer(
-                    d_orig,
+                    d_residue_emb,
+                    d_pair_emb,
                     d_scalar_per_head,
                     n_query_point_per_head,
                     n_value_point_per_head,
@@ -496,7 +501,8 @@ class InvariantPointAttentionModule(nn.Module):
 class Denoiser(nn.Module):
     def __init__(
         self,
-        d_emb,
+        d_residue_emb,
+        d_pair_emb,
         n_ipa_layers,
         d_scalar_per_head,
         n_query_point_per_head,
@@ -505,16 +511,17 @@ class Denoiser(nn.Module):
         aa_vocab_size,
     ):
         super().__init__()
-        self.sequence_embedding = nn.Embedding(25, d_emb)
+        self.sequence_embedding = nn.Embedding(25, d_residue_emb)
         self.to_res_emb = nn.Sequential(
-            nn.Linear(d_emb * 2, d_emb),
+            nn.Linear(d_residue_emb * 2, d_residue_emb),
             nn.ReLU(),
-            nn.Linear(d_emb, d_emb),
+            nn.Linear(d_residue_emb, d_residue_emb),
         )
 
         self.ipa = InvariantPointAttentionModule(
             n_ipa_layers,
-            d_emb,
+            d_residue_emb,
+            d_pair_emb,
             d_scalar_per_head,
             n_query_point_per_head,
             n_value_point_per_head,
@@ -524,27 +531,27 @@ class Denoiser(nn.Module):
         d_beta_emb = 3  # dimension for beta encoding
 
         self.coordinate_denoising = nn.Sequential(
-            nn.Linear(d_emb + d_beta_emb, d_emb),
+            nn.Linear(d_residue_emb + d_beta_emb, d_residue_emb),
             nn.ReLU(),
-            nn.Linear(d_emb, d_emb),
+            nn.Linear(d_residue_emb, d_residue_emb),
             nn.ReLU(),
-            nn.Linear(d_emb, 3),
+            nn.Linear(d_residue_emb, 3),
         )
 
         self.orientation_denoising = nn.Sequential(
-            nn.Linear(d_emb + d_beta_emb, d_emb),
+            nn.Linear(d_residue_emb + d_beta_emb, d_residue_emb),
             nn.ReLU(),
-            nn.Linear(d_emb, d_emb),
+            nn.Linear(d_residue_emb, d_residue_emb),
             nn.ReLU(),
-            nn.Linear(d_emb, 3),
+            nn.Linear(d_residue_emb, 3),
         )
 
         self.sequence_denoising = nn.Sequential(
-            nn.Linear(d_emb + d_beta_emb, d_emb),
+            nn.Linear(d_residue_emb + d_beta_emb, d_residue_emb),
             nn.ReLU(),
-            nn.Linear(d_emb, d_emb),
+            nn.Linear(d_residue_emb, d_residue_emb),
             nn.ReLU(),
-            nn.Linear(d_emb, aa_vocab_size),
+            nn.Linear(d_residue_emb, aa_vocab_size),
             nn.Softmax(dim=-1),
         )
 
@@ -621,7 +628,8 @@ class OrientationLoss(nn.Module):
 class DiffAb(pl.LightningModule):
     def __init__(
         self,
-        d_emb,
+        d_residue_emb,
+        d_pair_emb,
         n_ipa_layers,
         d_scalar_per_head,
         n_query_point_per_head,
@@ -640,13 +648,14 @@ class DiffAb(pl.LightningModule):
         super().__init__()
 
         self.sched = cosine_variance_schedule(T=T, s=s, beta_max=beta_max)
-        self.residue_context_embedding = ResidueEmbedding(n_atoms, d_emb)
+        self.residue_context_embedding = ResidueEmbedding(n_atoms, d_residue_emb)
         self.pair_context_embedding = PairEmbedding(
-            n_atoms, d_emb, max_dist_to_consider
+            n_atoms, d_pair_emb, max_dist_to_consider
         )
 
         self.denoiser = Denoiser(
-            d_emb,
+            d_residue_emb,
+            d_pair_emb,
             n_ipa_layers,
             d_scalar_per_head,
             n_query_point_per_head,

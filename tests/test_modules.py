@@ -141,14 +141,16 @@ def test_PairEmbedding():
 
 
 def test_InvariantPointAttentionLayer():
-    d_orig = 32
+    d_residue_emb = 32
+    d_pair_emb = 16
     d_scalar_per_head = 16
     n_query_point_per_head = 4
     n_value_point_per_head = 4
     n_head = 8
 
     ipa = InvariantPointAttentionLayer(
-        d_orig,
+        d_residue_emb,
+        d_pair_emb,
         d_scalar_per_head,
         n_query_point_per_head,
         n_value_point_per_head,
@@ -156,18 +158,19 @@ def test_InvariantPointAttentionLayer():
     )
 
     bsz, n_res = 32, 16
-    x = torch.rand(bsz, n_res, d_orig)
-    e = torch.rand(bsz, n_res, n_res, d_orig)
+    x = torch.rand(bsz, n_res, d_residue_emb)
+    e = torch.rand(bsz, n_res, n_res, d_pair_emb)
 
     r = torch.rand(bsz, n_res, 3, 3)
     t = torch.rand(bsz, n_res, 3)
 
     out = ipa(x, e, r, t)
-    assert out.shape == (bsz, n_res, d_orig)
+    assert out.shape == (bsz, n_res, d_residue_emb)
 
 
 def test_InvariantPointAttentionModule():
-    d_emb = 32
+    d_residue_emb = 32
+    d_pair_emb = 16
     d_scalar_per_head = 16
 
     n_query_point_per_head = 4
@@ -178,7 +181,8 @@ def test_InvariantPointAttentionModule():
 
     ipa = InvariantPointAttentionModule(
         n_layers,
-        d_emb,
+        d_residue_emb,
+        d_pair_emb,
         d_scalar_per_head,
         n_query_point_per_head,
         n_value_point_per_head,
@@ -186,18 +190,19 @@ def test_InvariantPointAttentionModule():
     )
 
     bsz, n_residues = 32, 16
-    res_emb = torch.rand(bsz, n_residues, d_emb)
-    pair_emb = torch.randn(bsz, n_residues, n_residues, d_emb)
+    res_emb = torch.rand(bsz, n_residues, d_residue_emb)
+    pair_emb = torch.randn(bsz, n_residues, n_residues, d_pair_emb)
 
     orientations = torch.rand(bsz, n_residues, 3, 3)
     translations = torch.rand(bsz, n_residues, 3)
 
     out = ipa(res_emb, pair_emb, orientations, translations)
-    assert out.shape == (bsz, n_residues, d_emb)
+    assert out.shape == (bsz, n_residues, d_residue_emb)
 
 
 def test_Denoiser():
-    d_emb = 32
+    d_residue_emb = 32
+    d_pair_emb = 16
     n_ipa_layers = 4
     d_scalar_per_head = 12
     n_query_point_per_head = 4
@@ -205,17 +210,19 @@ def test_Denoiser():
     n_head = 8
 
     denoiser = Denoiser(
-        d_emb,
+        d_residue_emb,
+        d_pair_emb,
         n_ipa_layers,
         d_scalar_per_head,
         n_query_point_per_head,
         n_value_point_per_head,
         n_head,
+        aa_vocab_size=21,
     )
 
     bsz, n_residues = 32, 16
-    res_emb = torch.rand(bsz, n_residues, d_emb)
-    pair_emb = torch.randn(bsz, n_residues, n_residues, d_emb)
+    res_emb = torch.rand(bsz, n_residues, d_residue_emb)
+    pair_emb = torch.randn(bsz, n_residues, n_residues, d_pair_emb)
     beta = torch.rand(bsz)
 
     generation_mask = torch.randint(0, 2, (bsz, n_residues))
@@ -238,7 +245,7 @@ def test_Denoiser():
 
     assert out["translations_eps"].shape == (bsz, n_residues, 3)
     assert out["orientations_t0"].shape == (bsz, n_residues, 3, 3)
-    assert out["seq_posterior"].shape == (bsz, n_residues, 20)
+    assert out["seq_posterior"].shape == (bsz, n_residues, 21)
 
 
 @pytest.mark.parametrize(
@@ -246,7 +253,8 @@ def test_Denoiser():
     [(True, True), (True, False), (False, True), (False, False)],
 )
 def test_DiffAb_encode_context(generate_structure, generate_sequence):
-    d_emb = 32
+    d_residue_emb = 32
+    d_pair_emb = 16
     n_ipa_layers = 4
     d_scalar_per_head = 12
     n_query_point_per_head = 4
@@ -254,7 +262,8 @@ def test_DiffAb_encode_context(generate_structure, generate_sequence):
     n_head = 8
 
     diffab = DiffAb(
-        d_emb,
+        d_residue_emb,
+        d_pair_emb,
         n_ipa_layers,
         d_scalar_per_head,
         n_query_point_per_head,
@@ -299,12 +308,13 @@ def test_DiffAb_encode_context(generate_structure, generate_sequence):
     )
 
     n_res = sb.get_max_n_residues()
-    assert res_emb.shape == (1, n_res, d_emb)
-    assert pair_emb.shape == (1, n_res, n_res, d_emb)
+    assert res_emb.shape == (1, n_res, d_residue_emb)
+    assert pair_emb.shape == (1, n_res, n_res, d_pair_emb)
 
 
 def test_DiffAb_denoise():
-    d_emb = 32
+    d_residue_emb = 32
+    d_pair_emb = 16
     n_ipa_layers = 4
     d_scalar_per_head = 12
     n_query_point_per_head = 4
@@ -312,7 +322,8 @@ def test_DiffAb_denoise():
     n_head = 8
 
     diffab = DiffAb(
-        d_emb,
+        d_residue_emb,
+        d_pair_emb,
         n_ipa_layers,
         d_scalar_per_head,
         n_query_point_per_head,
@@ -356,10 +367,10 @@ def test_DiffAb_denoise():
     )
 
     n_res = sb.get_max_n_residues()
-    assert res_context_emb.shape == (1, n_res, d_emb)
-    assert pair_context_emb.shape == (1, n_res, n_res, d_emb)
+    assert res_context_emb.shape == (1, n_res, d_residue_emb)
+    assert pair_context_emb.shape == (1, n_res, n_res, d_pair_emb)
 
-    seq_idx_t = torch.randint(0, 20, (1, n_res))
+    seq_idx_t = torch.randint(0, 21, (1, n_res))
     translations_t = torch.randn(1, n_res, 3)
     orientations_t = torch.randn(1, n_res, 3, 3)
     beta = torch.rand(1)

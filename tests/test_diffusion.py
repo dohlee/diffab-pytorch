@@ -29,7 +29,7 @@ def test_SequenceDiffuser():
         seq, t=torch.full((bsz,), 90).long(), generation_mask=generate_all
     )
 
-    assert p_1.shape == p_90.shape == (bsz, L, 20)
+    assert p_1.shape == p_90.shape == (bsz, L, 21)
 
     for seq_idx in range(bsz):
         for pos_idx in range(L):
@@ -46,7 +46,7 @@ def test_SequenceDiffuser():
         seq, t=torch.full((bsz,), fill_value=90).long(), generation_mask=generate_all
     )
 
-    assert p_1.shape == p_90.shape == (bsz, L, 20)
+    assert p_1.shape == p_90.shape == (bsz, L, 21)
 
     for seq_idx in range(bsz):
         for pos_idx in range(L):
@@ -56,7 +56,7 @@ def test_SequenceDiffuser():
     p_10 = seq_diffuser.forward_prob_from_t0(
         seq, t=torch.full((bsz,), fill_value=10).long(), generation_mask=generation_mask
     )
-    seq_sampled = torch.multinomial(p_10.view(-1, 20), num_samples=1).view(bsz, L)
+    seq_sampled = torch.multinomial(p_10.view(-1, 21), num_samples=1).view(bsz, L)
 
     posterior = seq_diffuser.posterior_single_step(
         seq_sampled,
@@ -64,7 +64,7 @@ def test_SequenceDiffuser():
         t=torch.full((bsz,), fill_value=10).long(),
         generation_mask=generation_mask,
     )
-    assert p_10.shape == posterior.shape == (bsz, L, 20)
+    assert p_10.shape == posterior.shape == (bsz, L, 21)
 
     for seq_idx in range(bsz):
         for pos_idx in range(L):
@@ -96,8 +96,8 @@ def test_SequenceDiffuser_diffuse():
     )
 
     assert seq_t2.shape == seq_t99.shape == (bsz, L)
-    assert post_t2.shape == (bsz, L, 20)
-    assert post_t99.shape == (bsz, L, 20)
+    assert post_t2.shape == (bsz, L, 21)
+    assert post_t99.shape == (bsz, L, 21)
 
     # sequence at t99 should deviate more from original sequence
     assert (seq_t2 != seq).sum() < (seq_t99 != seq).sum()
@@ -108,11 +108,12 @@ def test_CoordinateDiffuser():
 
     bsz, L = 32, 100
     xyz = torch.randn(bsz, L, 3)
+    t = torch.randint(0, 100, (bsz,)).long()
 
     generation_mask = torch.randint(0, 2, (bsz, L)).bool()
 
     xyz_t, eps = coord_diffuser.diffuse_from_t0(
-        xyz, t=2, generation_mask=generation_mask, return_eps=True
+        xyz, t=t, generation_mask=generation_mask, return_eps=True
     )
     assert xyz_t.shape == (bsz, L, 3)
     assert eps.shape == (bsz, L, 3)
