@@ -1,4 +1,6 @@
 data/
+!data/meta.csv
+
 note/
 cache/
 
