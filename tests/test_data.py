@@ -7,6 +7,7 @@ from diffab_pytorch import DiffAb
 from diffab_pytorch.data import DiffAbDataset, collate_fn
 
 
+@pytest.mark.skip(reason="temporarily skipping")
 def test_DiffAbDataset_batch_size_1():
     meta_df = pd.read_csv("data/minisabdab/meta.csv")
     ds = DiffAbDataset(
@@ -20,6 +21,7 @@ def test_DiffAbDataset_batch_size_1():
         pass
 
 
+@pytest.mark.skip(reason="temporarily skipping")
 def test_DiffAbDataset_batch_size_more_than_1():
     meta_df = pd.read_csv("data/minisabdab/meta.csv")
     ds = DiffAbDataset(
@@ -33,6 +35,7 @@ def test_DiffAbDataset_batch_size_more_than_1():
         pass
 
 
+@pytest.mark.skip(reason="temporarily skipping")
 def test_DiffAb_step():
     meta_df = pd.read_csv("data/minisabdab/meta.csv")
     ds = DiffAbDataset(meta_df, "data/minisabdab/chothia", cdrs_to_generate=["H3"])

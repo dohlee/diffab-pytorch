@@ -84,8 +84,6 @@ def collate_fn(batch):
         "orientations": sb.backbone_orientations(),
         "backbone_dihedrals": backbone_dihedrals,
         "backbone_dihedrals_mask": backbone_dihedrals_mask,
-        "distmat": distmat,
-        "distmat_mask": distmat_mask,
         "pairwise_dihedrals": pairwise_dihedrals,
         "atom_mask": sb.get_atom_mask(),
         "seq_idx": sb.get_seq_idx(),
@@ -93,6 +91,8 @@ def collate_fn(batch):
         "residue_idx": torch.arange(sb.get_max_n_residues()).unsqueeze(0),
         "residue_mask": sb.get_residue_mask(),
         "generation_mask": sb.get_cdr_mask(subset=cdrs_to_generate),
+        # "distmat": distmat,
+        # "distmat_mask": distmat_mask,
     }
 
     return ret
@@ -177,11 +177,11 @@ if __name__ == "__main__":
     from torch.utils.data import DataLoader
 
     dataset = DiffAbDataset(
-        meta_df=pd.read_csv("data/sabdab_summary_all.tsv", sep="\t"),
+        meta_df=pd.read_csv("data/meta.csv"),
         data_dir="data/all_structures/chothia",
         cdrs_to_generate=["H3"],
     )
-    loader = DataLoader(dataset, batch_size=1)
+    loader = DataLoader(dataset, batch_size=4, collate_fn=collate_fn, num_workers=1)
 
     for _ in tqdm.tqdm(loader):
         pass
